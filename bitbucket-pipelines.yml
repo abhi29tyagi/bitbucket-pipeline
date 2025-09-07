@@ -1,0 +1,1351 @@
+export: true
+
+image: node:18
+
+definitions:
+  caches:
+    sonar: ~/.sonar/cache
+  steps:
+    - step: &setup-shared-pipelines
+        name: 🔧 Setup Shared Pipelines
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ "$BITBUCKET_PR_DESTINATION_BRANCH" != "develop" ]; then
+              echo "Skipping PR build: target is $BITBUCKET_PR_DESTINATION_BRANCH (want develop)";
+              exit 0;
+            fi
+            echo "=== Starting Shared Pipelines Setup ==="
+            pwd
+            echo "Current user: $(whoami)"
+
+            BITBUCKET_WORKSPACE="protocol33"
+            SHARED_PIPELINES_REPO="${SHARED_PIPELINES_REPO:-${BITBUCKET_WORKSPACE}/shared-pipelines}"
+            SHARED_PIPELINES_BRANCH="main"
+            SKIP_SHALLOW_CLONE="true"
+            
+            echo "Using workspace: ${BITBUCKET_WORKSPACE}"
+            echo "Using repo: ${SHARED_PIPELINES_REPO}"
+            echo "Using branch: ${SHARED_PIPELINES_BRANCH}"
+
+            # Clone shared-pipelines repository
+            echo "Cloning shared-pipelines repository..."
+            
+            
+            # Clone the repository
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+            git clone git@bitbucket.org:protocol33/shared-pipelines.git && {
+              echo "Repository cloned successfully"
+            } || {
+              echo "ERROR: Failed to clone repository"
+              exit 1
+            }
+            fi
+            # Debug: Show what's in the downloaded repository
+            echo "=== Contents of downloaded shared-pipelines repository ==="
+            echo "Current directory: $(pwd)"
+            echo "current directory contents:"
+            ls -la 
+            echo "shared-pipelines directory contents:"
+            ls -la shared-pipelines/
+
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \;
+
+            echo "=== Shared Pipelines Setup Completed ==="
+        artifacts:
+          - shared-pipelines/**
+
+    - step: &setup-env
+        name: 🔧 Setup Environment
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Set environment based on branch or deployment context
+            case "${BITBUCKET_BRANCH:-}" in
+              "main")
+                ENVIRONMENT="production"
+                ;;
+              "develop")
+                ENVIRONMENT="development"
+                ;;
+              "release/"*)
+                ENVIRONMENT="uat"
+                ;;
+              *)
+                ENVIRONMENT="${ENVIRONMENT:-development}"
+                ;;
+            esac
+            
+            echo "🔧 Setting up environment: ${ENVIRONMENT}"
+
+            # only if its a PR, run the custom environment setup script
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              echo "Running custom environment setup script for PR: $BITBUCKET_PR_ID"
+              CUSTOM_ENV_SCRIPT="${CUSTOM_ENV_SETUP_SCRIPT:-custom-env.sh}"
+              if [ -f "$CUSTOM_ENV_SCRIPT" ]; then
+                echo "Running custom environment setup: $CUSTOM_ENV_SCRIPT"
+                chmod +x "$CUSTOM_ENV_SCRIPT" && ./"$CUSTOM_ENV_SCRIPT"
+              else
+                echo "No custom environment setup script found"
+              fi
+            fi
+            
+            # Run custom environment setup script if it exists
+            CUSTOM_ENV_SCRIPT="${CUSTOM_ENV_SETUP_SCRIPT:-custom-env.sh}"
+            
+            if [ -f "$CUSTOM_ENV_SCRIPT" ]; then
+              echo "Running custom environment setup: $CUSTOM_ENV_SCRIPT"
+              chmod +x "$CUSTOM_ENV_SCRIPT" && ./"$CUSTOM_ENV_SCRIPT"
+            else
+              echo "No custom environment setup script found"
+            fi
+            
+            # Create .env file for docker-compose
+            {
+              echo "# Environment configuration for docker-compose"
+              echo "NODE_ENV=${ENVIRONMENT}"
+            } > .env
+
+            # Append all non-system environment variables as key=value
+            # Excludes Bitbucket/system vars to avoid noise and secrets leakage
+            while IFS='=' read -r key value; do
+              case "$key" in
+                BITBUCKET_*|PATH|HOME|USER|SHELL|PWD|OLDPWD|_|SSH_*|SHLVL|LANG|LS_COLORS|LESSOPEN|LESSCLOSE|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID)
+                  continue ;;
+              esac
+              # Skip empty keys or values containing newlines
+              [ -z "$key" ] && continue
+              printf '%s=%s\n' "$key" "$value" >> .env
+            done < <(env | grep -E '^[A-Z_][A-Z0-9_]*=')
+            
+            echo "✅ Environment prepared: ${ENVIRONMENT}"
+            echo "📄 Created .env file with $(wc -l < .env) variables"
+            echo "📋 .env contents:"
+            cat .env
+        artifacts:
+          - .env
+
+    - step: &lint
+        name: 🔍 Lint Code
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ "${SKIP_LINT}" = "true" ]; then
+              echo "Skipping lint because SKIP_LINT=true"
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            [ -f "${APP_PATH}/package.json" ] || { echo "Missing ${APP_PATH}/package.json in consumer repo"; exit 1; }
+
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            # This command is necessary because Bitbucket self-hosted runners might inherit DOCKER_HOST or DOCKER_CONTEXT environment variables that force the Docker CLI
+            # that force the Docker CLI to attempt connection over TCP (e.g., tcp://localhost:2375), even when the daemon is running locally and accessible via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Use the host user ID to avoid permission issues
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)/${APP_PATH}":/app \
+              -w /app \
+              -e HOME=/tmp \
+              node:18 bash -c '
+              # Set npm to use temporary directories to avoid permission issues
+              export npm_config_cache=/tmp/.npm
+              export npm_config_userconfig=/tmp/.npmrc
+              
+              # Install dependencies
+              if [ -f package-lock.json ]; then
+                npm ci --cache /tmp/.npm
+              elif [ -f yarn.lock ]; then
+                yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile --store-dir /tmp/.pnpm-store
+              else
+                npm install --cache /tmp/.npm
+              fi
+              
+              # Run lint and capture output
+              if [ -f yarn.lock ]; then
+                yarn lint 2>&1 | tee /tmp/lint-output.txt
+                LINT_EXIT_CODE=${PIPESTATUS[0]}
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm run lint 2>&1 | tee /tmp/lint-output.txt
+                LINT_EXIT_CODE=${PIPESTATUS[0]}
+              else
+                npm run lint 2>&1 | tee /tmp/lint-output.txt
+                LINT_EXIT_CODE=${PIPESTATUS[0]}
+              fi
+              
+              # Create lint results file
+              echo "=== Lint Results ===" > lint-results.txt
+              echo "Timestamp: $(date)" >> lint-results.txt
+              echo "Exit Code: $LINT_EXIT_CODE" >> lint-results.txt
+              echo "Output:" >> lint-results.txt
+              cat /tmp/lint-output.txt >> lint-results.txt
+              
+              # Exit with lint result
+              exit $LINT_EXIT_CODE
+            '
+        artifacts:
+          - lint-results.txt
+
+    - step: &test
+        name: 🧪 Run Tests
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ "${SKIP_TESTS}" = "true" ]; then
+              echo "Skipping tests because SKIP_TESTS=true"
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            [ -f "${APP_PATH}/package.json" ] || { echo "Missing ${APP_PATH}/package.json in consumer repo"; exit 1; }
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Use the host user ID to avoid permission issues
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)/${APP_PATH}":/app \
+              -w /app \
+              -e HOME=/tmp \
+              node:18 bash -c '
+              # Set npm to use temporary directories to avoid permission issues
+              export npm_config_cache=/tmp/.npm
+              export npm_config_userconfig=/tmp/.npmrc
+              
+              # Install dependencies
+              if [ -f package-lock.json ]; then
+                npm ci --cache /tmp/.npm
+              elif [ -f yarn.lock ]; then
+                yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile --store-dir /tmp/.pnpm-store
+              else
+                npm install --cache /tmp/.npm
+              fi
+              
+              # Run tests with coverage and capture output
+              if [ -f yarn.lock ]; then
+                yarn test:coverage 2>&1 | tee /tmp/test-output.txt
+                TEST_EXIT_CODE=${PIPESTATUS[0]}
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm run test:coverage 2>&1 | tee /tmp/test-output.txt
+                TEST_EXIT_CODE=${PIPESTATUS[0]}
+              else
+                npm run test:coverage 2>&1 | tee /tmp/test-output.txt
+                TEST_EXIT_CODE=${PIPESTATUS[0]}
+              fi
+              
+              # Create test results file
+              echo "=== Test Results ===" > test-results.xml
+              echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" >> test-results.xml
+              echo "<testsuites>" >> test-results.xml
+              echo "  <testsuite name=\"test-run\" timestamp=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\">" >> test-results.xml
+              echo "    <testcase name=\"test-execution\" classname=\"test-run\">" >> test-results.xml
+              if [ $TEST_EXIT_CODE -eq 0 ]; then
+                echo "      <system-out>Tests passed successfully</system-out>" >> test-results.xml
+              else
+                echo "      <failure message=\"Tests failed with exit code $TEST_EXIT_CODE\">" >> test-results.xml
+                echo "        <![CDATA[$(cat /tmp/test-output.txt)]]>" >> test-results.xml
+                echo "      </failure>" >> test-results.xml
+              fi
+              echo "    </testcase>" >> test-results.xml
+              echo "  </testsuite>" >> test-results.xml
+              echo "</testsuites>" >> test-results.xml
+              
+              # Exit with test result
+              exit $TEST_EXIT_CODE
+            '
+            
+            # Optional: print minimal coverage summary if available
+            cat coverage/lcov.info >/dev/null 2>&1 || true
+        artifacts:
+          - test-results.xml
+
+    - step: &sonar
+        name: 📊 SonarQube Analysis (Quality gate)
+        caches: [sonar]
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            # Minimal useful diagnostics
+            [ -n "${SKIP_SONAR:-}" ] && echo "INFO: SKIP_SONAR=${SKIP_SONAR}"
+            
+            # Check multiple possible variable names for skipping SonarQube
+            if [ "${SKIP_SONAR}" = "true" ] || [ "${SONAR_SKIP}" = "true" ] ; then
+              echo "Skipping SonarQube because SKIP_SONAR=true or SONAR_SKIP=true or SKIP_SONARQUBE=true"
+              exit 0
+            fi
+            
+            # Use Docker container with correct Java version for SonarQube
+            echo "Running SonarQube analysis checks..."
+            
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Pull the correct SonarQube scanner CLI image
+            docker pull sonarsource/sonar-scanner-cli:latest || {
+              echo "ERROR: Failed to pull sonarsource/sonar-scanner-cli:latest"
+              exit 1
+            }
+            
+            # Set the Docker command for scanner CLI
+            SONAR_CMD="docker run --rm -v $(pwd):/workspace -w /workspace sonarsource/sonar-scanner-cli:latest sonar-scanner"
+            
+            
+            # Ensure we're using self-hosted SonarQube, not SonarCloud
+            export SONAR_HOST_URL=$SONAR_HOST_URL
+            export SONAR_TOKEN=$SONAR_TOKEN
+            
+            # Fix potential double slash issue in URL
+            # Remove trailing slash from SONAR_HOST_URL if present
+            SONAR_HOST_URL="${SONAR_HOST_URL%/}"
+            echo "SONAR_URL: $SONAR_HOST_URL"
+            
+            # Create branch-specific project keys for Community Edition
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              # For PRs, use PR-specific project key
+              export SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-pr-${BITBUCKET_PR_ID}"
+              echo "INFO: PR detected - using project key: $SONAR_PROJECT_KEY"
+            else
+              # For regular branches, use branch-specific project key
+              export SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-${BITBUCKET_BRANCH}"
+              echo "INFO: Branch detected - using project key: $SONAR_PROJECT_KEY"
+            fi
+            
+            # Debug: Show configuration
+            echo "Project Key: $SONAR_PROJECT_KEY"
+            
+            # For Community Edition, we can only analyze the main branch
+            # No branch analysis, no pull request analysis
+            # Community Edition: analyze main branch only
+            
+            # Note: Configuration is passed directly to sonar-scanner via -D parameters
+            # This avoids conflicts with consumer repo's sonar-project.properties
+            
+            # Execute SonarQube scanner
+            echo "INFO: Running SonarQube scanner for project: $SONAR_PROJECT_KEY"
+            echo "INFO: SonarQube URL: $SONAR_HOST_URL"
+            
+            # Run the scanner with proper parameters
+            $SONAR_CMD \
+              -Dsonar.host.url="$SONAR_HOST_URL" \
+              -Dsonar.login="$SONAR_TOKEN" \
+              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+              -Dsonar.projectName="$SONAR_PROJECT_KEY" \
+              -Dsonar.projectVersion="1.0" \
+              -Dsonar.sources="." \
+              -Dsonar.exclusions="node_modules/**,coverage/**,dist/**,build/**,.git/**,shared-pipelines/**" \
+              -Dsonar.coverage.exclusions="**/*.test.js,**/*.spec.js,**/*.test.ts,**/*.spec.ts" \
+              -Dsonar.test.inclusions="**/*.test.js,**/*.spec.js,**/*.test.ts,**/*.spec.ts" || {
+              echo "ERROR: SonarQube scanner failed"
+              exit 1
+            }
+            
+            echo "✅ SonarQube scanner completed successfully"
+            
+            # Wait for analysis to be processed by SonarQube
+            echo "Waiting for SonarQube to process analysis..."
+            sleep 30
+            
+            # Check quality gate results (no authentication required)
+            echo "Checking quality gate for: $SONAR_PROJECT_KEY"
+            
+            # Get quality gate response
+            echo "=== Getting Quality Gate Response ==="
+            RESPONSE_BODY=$(curl -s "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY")
+            CURL_EXIT_CODE=$?
+            
+            [ "$CURL_EXIT_CODE" -ne 0 ] && echo "WARNING: Sonar API curl exit=$CURL_EXIT_CODE"
+            
+            # Save the raw response to a file
+            echo "$RESPONSE_BODY" > quality-gate-response.json
+            
+            if [ -n "$RESPONSE_BODY" ]; then
+              # Check if response is valid JSON
+              if echo "$RESPONSE_BODY" | jq . > /dev/null 2>&1; then
+                STATUS=$(echo "$RESPONSE_BODY" | jq -r '.projectStatus.status // "UNKNOWN"')
+                echo "Quality Gate Status: $STATUS"
+                
+                # Create a formatted quality gate summary
+                echo "=== Quality Gate Summary ===" > quality-gate-summary.txt
+                echo "Project: $SONAR_PROJECT_KEY" >> quality-gate-summary.txt
+                echo "Timestamp: $(date)" >> quality-gate-summary.txt
+                echo "Status: $STATUS" >> quality-gate-summary.txt
+                echo "" >> quality-gate-summary.txt
+                
+                if [ "$STATUS" = "OK" ]; then
+                  echo "✅ Quality gate PASSED" >> quality-gate-summary.txt
+                  echo "✅ Quality gate PASSED"
+                  echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                elif [ "$STATUS" = "UNKNOWN" ]; then
+                  echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet" >> quality-gate-summary.txt
+                  echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet"
+                else
+                  echo "❌ Quality gate FAILED: $STATUS" >> quality-gate-summary.txt
+                  echo "❌ Quality gate FAILED: $STATUS"
+                  echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                  if [ -n "$BITBUCKET_PR_ID" ]; then
+                    echo "PR context detected; continuing despite quality gate failure"
+                  else
+                    echo "Failing pipeline (non-PR) due to quality gate failure"
+                    exit 1
+                  fi
+                fi
+                
+                # Add detailed conditions if available
+                if echo "$RESPONSE_BODY" | jq -e '.projectStatus.conditions' > /dev/null 2>&1; then
+                  echo "" >> quality-gate-summary.txt
+                  echo "=== Quality Gate Conditions ===" >> quality-gate-summary.txt
+                  echo "$RESPONSE_BODY" | jq -r '.projectStatus.conditions[] | "\(.metricKey): \(.status) (Threshold: \(.errorThreshold), Actual: \(.actualValue))"' >> quality-gate-summary.txt
+                fi
+                
+              else
+                echo "⚠️  Invalid JSON response from quality gate API" >> quality-gate-summary.txt
+                echo "⚠️  Invalid JSON response from quality gate API"
+                echo "Continuing without quality gate validation"
+              fi
+            else
+              echo "⚠️  No response from quality gate API" >> quality-gate-summary.txt
+              echo "⚠️  No response from quality gate API"
+              echo "Continuing without quality gate validation"
+            fi
+
+            
+            
+        artifacts: 
+           - quality-gate-response.json
+           - quality-gate-summary.txt
+
+    - step: &teardown-sonar
+        name: 🧹 Cleanup SonarQube Project
+        caches: [sonar]
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Only run for PRs that are being closed/merged
+            if [ -z "$BITBUCKET_PR_ID" ]; then
+              echo "Not a PR - skipping SonarQube cleanup"
+              exit 0
+            fi
+            
+            # Check if we should skip cleanup
+            if [ "${SKIP_SONAR_CLEANUP}" = "true" ]; then
+              echo "Skipping SonarQube cleanup because SKIP_SONAR_CLEANUP=true"
+              exit 0
+            fi
+            
+            echo "🧹 Cleaning up SonarQube project for PR #$BITBUCKET_PR_ID"
+            
+            # Prepare Docker CLI environment
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Use the same project key logic as the sonar step
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-pr-${BITBUCKET_PR_ID}"
+            else
+              SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-${BITBUCKET_BRANCH}"
+            fi
+            
+            echo "Project Key to delete: $SONAR_PROJECT_KEY"
+            echo "SonarQube URL: $SONAR_HOST_URL"
+            
+            # Delete the project using SonarQube API
+            echo "Deleting SonarQube project..."
+            RESPONSE=$(curl -s -w "%{http_code}" -X POST \
+              -u "$SONAR_TOKEN:" \
+              "$SONAR_HOST_URL/api/projects/delete?project=$SONAR_PROJECT_KEY")
+            
+            HTTP_CODE="${RESPONSE: -3}"
+            RESPONSE_BODY="${RESPONSE%???}"
+            
+            if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then
+              echo "✅ SonarQube project deleted successfully (or didn't exist)"
+              echo "Project: $SONAR_PROJECT_KEY"
+              echo "Status: $HTTP_CODE"
+            else
+              echo "⚠️  SonarQube project deletion returned unexpected status: $HTTP_CODE"
+              echo "Response: $RESPONSE_BODY"
+              # Don't fail the pipeline for cleanup issues
+            fi
+            
+            # Create cleanup summary
+            echo "=== SonarQube Cleanup Summary ===" > sonar-cleanup-summary.txt
+            echo "Project: $SONAR_PROJECT_KEY" >> sonar-cleanup-summary.txt
+            echo "Timestamp: $(date)" >> sonar-cleanup-summary.txt
+            echo "Status: $HTTP_CODE" >> sonar-cleanup-summary.txt
+            echo "Response: $RESPONSE_BODY" >> sonar-cleanup-summary.txt
+        artifacts:
+          - sonar-cleanup-summary.txt
+
+    - step: &build-nodejs
+        name: 🐳 Build Node.js Docker Image
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ "${SKIP_BUILD}" = "true" ]; then
+              echo "Skipping build because SKIP_BUILD=true"
+              exit 0
+            fi
+
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+
+            # Check if package-lock.json exists, generate if missing - WITH PROPER PERMISSIONS
+            if [ ! -f "package-lock.json" ] && [ -f "package.json" ]; then
+              echo "package-lock.json not found, generating it..."
+              USER_ID=$(id -u)
+              GROUP_ID=$(id -g)
+              docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+                -v "$(pwd)":/app -w /app \
+                -e HOME=/tmp \
+                node:18 bash -c '
+                export npm_config_cache=/tmp/.npm
+                npm install --package-lock-only --cache /tmp/.npm
+              ' || {
+                echo "ERROR: Failed to generate package-lock.json"
+                exit 1
+              }
+              echo "package-lock.json generated successfully"
+            fi
+
+            # Verify package-lock.json exists before building
+            if [ ! -f "package-lock.json" ]; then
+              echo "ERROR: package-lock.json is required for Docker build but not found"
+              echo "Please either:"
+              echo "1. Commit package-lock.json to your repository, or"
+              echo "2. Set SKIP_BUILD=true to skip Docker build"
+              exit 1
+            fi
+
+            echo "Building Docker image..."
+            docker build --cache-from "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest" \
+              -t "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" . || {
+              echo "ERROR: Docker build failed"
+              exit 1
+            }
+
+            docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" \
+              "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest"
+
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" \
+                "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:pr-$BITBUCKET_PR_ID"
+            fi
+
+            # Push with error checking (sequential to avoid race conditions)
+            if [ "$BITBUCKET_BRANCH" = "develop" ]; then
+              echo "Pushing latest image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest"
+              docker push "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest" || {
+                echo "ERROR: Failed to push latest image"
+                exit 1
+              }
+              echo "✅ Successfully pushed latest image"
+            else
+              echo "Skipping latest tag push (not on develop branch)"
+            fi
+
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              echo "Pushing PR image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:pr-$BITBUCKET_PR_ID"
+              docker push "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:pr-$BITBUCKET_PR_ID" || {
+                echo "ERROR: Failed to push PR image"
+                exit 1
+              }
+              echo "✅ Successfully pushed PR image"
+            fi
+
+            # Cleanup
+            docker rmi "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" 2>/dev/null || true
+            echo "Cleanup done"
+
+    - step: &build-nextjs
+        name: 🐳 Build Next.js App
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ "${SKIP_BUILD}" = "true" ]; then
+              echo "Skipping Next.js build because SKIP_BUILD=true"
+              exit 0
+            fi
+
+            # Check if this is actually a Next.js project
+            if [ ! -f "package.json" ] || ! grep -q '"next"' package.json; then
+              echo "ERROR: This is not a Next.js project (no 'next' dependency in package.json)"
+              echo "Use the Node.js pipeline instead"
+              exit 1
+            fi
+
+            echo "Building Next.js application..."
+            
+            # Install dependencies and build Next.js app
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)":/app -w /app \
+              -e HOME=/tmp \
+              node:18 bash -c '
+              export npm_config_cache=/tmp/.npm
+              export npm_config_userconfig=/tmp/.npmrc
+              
+              # Install dependencies
+              if [ -f package-lock.json ]; then
+                npm ci --cache /tmp/.npm
+              elif [ -f yarn.lock ]; then
+                yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile --store-dir /tmp/.pnpm-store
+              else
+                npm install --cache /tmp/.npm
+              fi
+              
+              # Build Next.js app
+              npm run build
+            ' || {
+              echo "ERROR: Next.js build failed"
+              exit 1
+            }
+            
+            echo "✅ Next.js build completed successfully"
+            echo "Build output: .next/ folder"
+            
+            # Create build summary
+            echo "=== Next.js Build Summary ===" > build-summary.txt
+            echo "Project Type: Next.js" >> build-summary.txt
+            echo "Build Output: .next/ folder" >> build-summary.txt
+            echo "Timestamp: $(date)" >> build-summary.txt
+            echo "Branch: $BITBUCKET_BRANCH" >> build-summary.txt
+            echo "Commit: $BITBUCKET_COMMIT" >> build-summary.txt
+            echo "Status: SUCCESS" >> build-summary.txt
+            
+            # Optional: Create static export if configured
+            if grep -q '"export"' package.json; then
+              echo "📦 Creating static export..."
+              docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+                -v "$(pwd)":/app -w /app \
+                -e HOME=/tmp \
+                node:18 bash -c '
+                export npm_config_cache=/tmp/.npm
+                npm run export
+              ' || {
+                echo "WARNING: Static export failed, but build succeeded"
+              }
+              echo "Static export: out/ folder"
+              echo "Static Export: out/ folder" >> build-summary.txt
+            fi
+            
+            echo "✅ Next.js build completed successfully"
+            
+            # Now create Docker image from the built Next.js app
+            echo "Creating Docker image from built Next.js app..."
+            
+            # Prepare Docker CLI environment
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Build Docker image from the built Next.js app
+            echo "Building Docker image..."
+            docker build --cache-from "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest" \
+              -t "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" . || {
+              echo "ERROR: Docker build failed"
+              exit 1
+            }
+            
+            # Tag the image
+            docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" \
+              "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest"
+            
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" \
+                "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:pr-$BITBUCKET_PR_ID"
+            fi
+            
+            # Push images
+            if [ "$BITBUCKET_BRANCH" = "develop" ]; then
+              echo "Pushing latest image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest"
+              docker push "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest" || {
+                echo "ERROR: Failed to push latest image"
+                exit 1
+              }
+              echo "✅ Successfully pushed latest image"
+            else
+              echo "Skipping latest tag push (not on develop branch)"
+            fi
+            
+            if [ -n "$BITBUCKET_PR_ID" ]; then
+              echo "Pushing PR image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:pr-$BITBUCKET_PR_ID"
+              docker push "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:pr-$BITBUCKET_PR_ID" || {
+                echo "ERROR: Failed to push PR image"
+                exit 1
+              }
+              echo "✅ Successfully pushed PR image"
+            fi
+            
+            # Cleanup
+            docker rmi "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" 2>/dev/null || true
+            echo "Docker cleanup done"
+            
+            # Update build summary
+            echo "Docker Image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" >> build-summary.txt
+            echo "Docker Image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest" >> build-summary.txt
+            echo "Docker Build: SUCCESS" >> build-summary.txt
+            
+            echo "✅ Next.js build + Docker image creation completed successfully"
+        artifacts:
+          - .next/**
+          - out/**
+          - build-summary.txt
+
+    - step: &scout
+        name: 🔒 Docker Scout Scan
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ "${SKIP_SCOUT}" = "true" ]; then
+              echo "Skipping Docker Scout because SKIP_SCOUT=true"
+              exit 0
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Use Docker Scout CLI container for scanning
+            echo "Preparing Docker Scout scan..."
+            docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest || {
+              echo "WARNING: Failed to pull latest image for scanning"
+              exit 0
+            }
+            
+            export DOCKER_SCOUT_HUB_USER="$DOCKERHUB_USERNAME"
+            export DOCKER_SCOUT_HUB_PASSWORD="$DOCKERHUB_TOKEN"
+            
+            echo "Running Docker Scout CVE scan..."
+            docker run --rm -u root \
+              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
+              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              docker/scout-cli cves --format json $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest > cve_report.json || {
+              echo "WARNING: Docker Scout CVE scan failed"
+              echo "{}" > cve_report.json
+            }
+            
+            # Check for critical/high CVEs and fail pipeline if found
+            echo "Analyzing CVE report..."
+            if [ -f cve_report.json ] && [ -s cve_report.json ]; then
+              # Check if jq is available for JSON parsing
+              if command -v jq >/dev/null 2>&1; then
+                CRITICAL_COUNT=$(jq -r '.vulnerabilities[] | select(.severity == "CRITICAL") | .id' cve_report.json 2>/dev/null | wc -l | tr -d ' ')
+                HIGH_COUNT=$(jq -r '.vulnerabilities[] | select(.severity == "HIGH") | .id' cve_report.json 2>/dev/null | wc -l | tr -d ' ')
+
+                if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                  echo "❌ CRITICAL: Found $CRITICAL_COUNT critical vulnerabilities"
+                  echo "Critical CVEs:"
+                  jq -r '.vulnerabilities[] | select(.severity == "CRITICAL") | "- " + .id + ": " + .title' cve_report.json 2>/dev/null
+                  if [ -n "$BITBUCKET_PR_ID" ]; then
+                    echo "PR context detected; continuing despite critical vulnerabilities"
+                  else
+                    echo "Failing pipeline (non-PR) due to critical vulnerabilities"
+                    exit 1
+                  fi
+                elif [ "$HIGH_COUNT" -gt 0 ]; then
+                  echo "⚠️  HIGH: Found $HIGH_COUNT high vulnerabilities - CONTINUING WITH WARNING"
+                  echo "High CVEs:"
+                  jq -r '.vulnerabilities[] | select(.severity == "HIGH") | "- " + .id + ": " + .title' cve_report.json 2>/dev/null
+                else
+                  echo "No critical vulnerabilities found"
+                fi
+              else
+                echo "⚠️  jq not available, skipping CVE severity analysis"
+              fi
+            else
+              echo "⚠️  CVE report not available or empty, skipping severity analysis"
+            fi
+            
+            echo "Generating SBOM..."
+            docker run --rm -u root \
+              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
+              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$(pwd)":/workspace \
+              -w /workspace \
+              docker/scout-cli sbom --format spdx --output sbom.json image://$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest || {
+              echo "WARNING: Docker Scout SBOM generation failed"
+              echo "{}" > sbom.json
+            }
+            
+            # Verify the SBOM file was created and has content
+            if [ -f "sbom.json" ] && [ -s "sbom.json" ]; then
+              echo "SBOM created: $(wc -c < sbom.json) bytes"
+            else
+              echo "❌ SBOM file not found or empty"
+              echo "Current directory contents:"
+              ls -la
+              echo "{}" > sbom.json
+            fi
+            
+            echo "Docker Scout analysis completed"
+        artifacts: [sbom.json]
+
+    - step: &promote-uat
+        name: 🚀 Promote latest -> uat
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest || {
+              echo "ERROR: Failed to pull latest image"
+              exit 1
+            }
+            docker tag $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:uat
+            docker push $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:uat || {
+              echo "ERROR: Failed to push uat image"
+              exit 1
+            }
+
+    - step: &promote-prod
+        name: 🏭 Promote uat -> production
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:uat || {
+              echo "ERROR: Failed to pull uat image"
+              exit 1
+            }
+            docker tag $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:uat $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:production
+            docker push $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:production || {
+              echo "ERROR: Failed to push production image"
+              exit 1
+            }
+
+    - step: &deploy-dev
+        name: 🚀 Deploy to Development
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - dev.runner
+        deployment: dev
+        script:
+          - |
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            cat > deploy.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest
+            export COMPOSE_PROJECT_NAME=dev
+            cat > docker-compose.override.yml << 'COMPOSE_EOF'
+            services:
+              app:
+                image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:latest
+                env_file:
+                  - .env
+            COMPOSE_EOF
+            docker-compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
+            sleep 10
+            curl -sf http://localhost:3000/health
+            EOF
+            
+            chmod +x deploy.sh
+            ./deploy.sh
+
+    - step: &deploy-uat
+        name: 🚀🚀 Deploy to UAT
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - uat.runner
+        deployment: uat  
+        script:
+          - |
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            cat > deploy.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:uat
+            export COMPOSE_PROJECT_NAME=uat
+            cat > docker-compose.override.yml << 'COMPOSE_EOF'
+            services:
+              app:
+                image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:uat
+                env_file:
+                  - .env
+            COMPOSE_EOF
+            docker-compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
+            sleep 10
+            curl -sf http://localhost:3000/health
+            EOF
+            
+            chmod +x deploy.sh
+            ./deploy.sh
+
+    - step: &deploy-prod
+        name: 🌟 Deploy to Production
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - prod.runner
+        deployment: prod
+        script:
+          - |
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            cat > deploy.sh << 'EOF'
+            #!/bin/bash
+            set -e
+            docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:production
+            export COMPOSE_PROJECT_NAME=prod
+            cat > docker-compose.override.yml << 'COMPOSE_EOF'
+            services:
+              app:
+                image: $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:production
+                env_file:
+                  - .env
+            COMPOSE_EOF
+            docker-compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
+            sleep 10
+            curl -sf http://localhost:3000/health
+            EOF
+            
+            chmod +x deploy.sh
+            ./deploy.sh
+
+    - step: &setup-preview-nginx
+        name: 🌐 Setup Nginx (One-time setup)
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Specifically ensure the nginx script is executable
+            chmod +x shared-pipelines/scripts/preview/nginx/install_or_update_preview_proxy.sh || {
+              echo "ERROR: Failed to make nginx script executable"
+              exit 1
+            }
+            
+            echo "Running nginx setup script..."
+            INTERNAL_DNS_ZONE="internal.${DOMAIN_NAME}" ./shared-pipelines/scripts/preview/nginx/install_or_update_preview_proxy.sh || {
+              echo "ERROR: Nginx setup script failed"
+              exit 1
+            }
+            
+            echo "✅ Nginx preview proxy configured/verified successfully"
+
+    - step: &deploy-preview
+        name: 👀 Deploy Preview (PR → develop)
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+            # PR-only guard: run this step only when PR targets develop
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ]; then
+              echo "Skipping: PR target=${BITBUCKET_PR_DESTINATION_BRANCH} (want develop)"
+              exit 0
+            fi
+            if [ "$BITBUCKET_PR_DESTINATION_BRANCH" != "develop" ]; then
+              echo "Not a PR to develop; skipping preview deploy."
+              exit 0
+            fi
+            
+            if [ -z "$BITBUCKET_PR_ID" ]; then
+              echo "No PR context; skipping preview deploy."
+              exit 0
+            fi
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Allocate a free preview port within fixed range
+            chmod +x shared-pipelines/scripts/preview/allocate_port.sh || {
+              echo "ERROR: Failed to make allocate_port script executable"
+              exit 1
+            }
+            PREVIEW_PORT_START=${PREVIEW_PORT_START:-40000} PREVIEW_PORT_SIZE=${PREVIEW_PORT_SIZE:-25} \
+            ./shared-pipelines/scripts/preview/allocate_port.sh
+            export PORT=$(cat preview_port.txt)
+          - |
+            # Compose up for preview
+            export PR_TAG="pr-${BITBUCKET_PR_ID}"
+            export COMPOSE_PROJECT_NAME="preview-${BITBUCKET_PR_ID}"
+            
+            # Clean up any existing containers with the same project name
+            docker-compose -f docker-compose.prod.yml down || true
+            
+            cat > docker-compose.override.yml << 'COMPOSE_EOF'
+            services:
+              app:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:pr-${BITBUCKET_PR_ID}
+                ports:
+                  - "${PORT}:3000"
+                env_file:
+                  - .env  
+            COMPOSE_EOF
+            docker-compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
+            sleep 10
+            curl -sf http://localhost:${PORT}/health
+
+            # DNS create (internal) - Disabled; I'm using a wildcard entry for the preview domain under BIND as *.internal.{DOMAIN_NAME}
+            # export ENVIRONMENT=${ENVIRONMENT:-preview}
+            # DNS_NAME=$(./shared-pipelines/scripts/dns/dns_create.sh)
+            # export PREVIEW_URL="https://${DNS_NAME}"
+            
+          - |
+            # Create per-host Nginx site and reload (uses preview_port.txt)
+            INTERNAL_DNS_ZONE="internal.${DOMAIN_NAME}" ./shared-pipelines/scripts/preview/nginx/nginx_enable_site.sh || true
+          - |
+            if [ -n "$BITBUCKET_USERNAME" ] && [ -n "$BITBUCKET_APP_PASSWORD" ]; then
+              export BITBUCKET_REPO_OWNER=${BITBUCKET_REPO_OWNER:-$BITBUCKET_WORKSPACE}
+              export BITBUCKET_REPO_SLUG=${BITBUCKET_REPO_SLUG:-$BITBUCKET_REPO_SLUG}
+              ./shared-pipelines/scripts/preview/pr_comment.sh || true
+            fi
+
+    - step: &teardown-preview
+        name: 🧹 Teardown Preview (PR closed/merged)
+        trigger: manual
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+            if [ -z "$BITBUCKET_PR_ID" ]; then
+              echo "No PR context; skipping preview teardown."
+              exit 0
+            fi
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Compose down for preview
+            export COMPOSE_PROJECT_NAME="preview-${BITBUCKET_PR_ID}"
+            
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            docker-compose -f docker-compose.prod.yml down || true
+            
+            # Remove per-host Nginx site and reload
+            chmod +x shared-pipelines/scripts/preview/nginx/nginx_disable_site.sh || {
+              echo "WARNING: Failed to make nginx_disable_site script executable"
+            }
+            INTERNAL_DNS_ZONE="internal.${DOMAIN_NAME}" ./shared-pipelines/scripts/preview/nginx/nginx_disable_site.sh || true
+            
+            # DNS delete (internal) - Disabled; I'm using a wildcard entry for the preview domain under BIND as *.internal.{DOMAIN_NAME}
+            # export ENVIRONMENT=${ENVIRONMENT:-preview}
+            # chmod +x shared-pipelines/scripts/dns/dns_delete.sh || {
+            #   echo "WARNING: Failed to make dns_delete script executable"
+            # }
+            # ./shared-pipelines/scripts/dns/dns_delete.sh || true
+
+  pipelines:
+    # ========================================
+    # CHOOSE THE RIGHT PIPELINE FOR YOUR PROJECT:
+    # 
+    # 🐳 NODE.JS/BACKEND PROJECTS:
+    #   - general-pipeline-develop: For Node.js/Express/API projects
+    #   - general-pipeline-pr: For Node.js PRs 
+    #
+    # 🐳 NEXT.JS/FRONTEND PROJECTS:
+    #   - general-pipeline-develop-nextjs: For Next.js projects
+    #   - general-pipeline-pr-nextjs: For Next.js PRs 
+    #
+    # 📋 OTHER PIPELINES:
+    #   - general-pipeline-release: For UAT deployments
+    #   - general-pipeline-main: For production deployments
+    #   - deploy-production: Manual production deployment
+    #   - manual-preview-teardown: Clean up any PR preview
+    # ========================================
+    
+    general-pipeline-develop-nodejs:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint
+      - step: *test
+      - step: *sonar
+      - step: *build-nodejs
+      - step: *scout
+      - step: *deploy-dev
+
+    general-pipeline-develop-nextjs:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint
+      - step: *test
+      - step: *sonar
+      - step: *build-nextjs
+      - step: *deploy-dev
+
+    general-pipeline-release:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *sonar
+      - step: *promote-uat
+      - step: *scout
+      - step: *deploy-uat
+
+    general-pipeline-main:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *sonar
+      - step: *promote-prod
+      - step: *scout
+
+    deploy-production:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *deploy-prod
+
+    general-pipeline-pr-nodejs:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint
+      - step: *test
+      - step: *sonar
+      - step: *build-nodejs
+      - step: *scout
+      - step: *setup-preview-nginx
+      - step: *deploy-preview
+      - step: *teardown-preview
+      - step: *teardown-sonar 
+
+    general-pipeline-pr-nextjs:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint
+      - step: *test
+      - step: *sonar
+      - step: *build-nextjs
+      - step: *setup-preview-nginx
+      - step: *deploy-preview
+      - step: *teardown-preview
+      - step: *teardown-sonar 
+
+    # preview-teardown:
+    #   - step: *teardown-preview
+      
+    # Manual preview teardown - allows manual cleanup of any PR
+    manual-preview-teardown:
+      - variables:
+        - name: BITBUCKET_PR_ID
+          description: "PR number to teardown (e.g., 101)"
+          default: "" 
+      - step: *teardown-preview
+      - step: *teardown-sonar    
