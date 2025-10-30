@@ -909,7 +909,7 @@ git merge hotfix/1.2.1
 
 ## 📄 License
 
-This project is licensed under the LMNTO License - just kidding :)
+This project is licensed under the..  - just kidding :)
 
 ## 🆘 Support
 
