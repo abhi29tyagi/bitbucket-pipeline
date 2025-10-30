@@ -6,7 +6,7 @@ This directory contains shared scripts used by the pipelines. It is organized by
 
 - [Structure](#structure)
 - [Script Categories](#script-categories)
-  - [Lint/Test/Build Scripts](#linttestbuild-scripts)
+  - [Lint/Test/Build Scripts](#lint-test-build-scripts)
   - [DNS Management Scripts](#dns-management-scripts)
   - [Traefik & SSL Certificates](#traefik-ssl-certificates)
   - [Preview Environment Scripts](#preview-environment-scripts)

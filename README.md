@@ -104,8 +104,8 @@ This pipeline library is designed with specific assumptions about your infrastru
 ## 📑 Table of Contents
 
 - [📑 Table of Contents](#table-of-contents)
-- [📌 Assumptions & Architecture](#-assumptions--architecture)
-- [🚀 Quick Start](#-quick-start)
+- [📌 Assumptions & Architecture](#assumptions-architecture)
+- [🚀 Quick Start](#quick-start)
   - [1. Enable Shared Pipelines in Your Repo](#enable-shared-pipelines-in-your-repo)
   - [2. Understanding YAML Imports](#understanding-yaml-imports)
   - [3. Set Up Required Variables](#set-up-required-variables)
@@ -115,17 +115,17 @@ This pipeline library is designed with specific assumptions about your infrastru
   - [✅ Supported Technologies](#supported-technologies)
   - [✅ Environments](#environments)
   - [✅ Pipeline Stages](#pipeline-stages)
-  - [🔔 PR-Merged → Auto Teardown (Cloudflare Worker)](#pr-merged-auto-teardown-cloudflare-worker)
+  - [PR-Merged → Auto Teardown (Cloudflare Worker)](#pr-merged-auto-teardown-cloudflare-worker)
 - [🏗️ Architecture](#architecture)
-  - [A Typical Pipeline Flow (e.g. Preview Env)](#a-typical-pipeline-flow-eg-preview-env)
+  - [A Typical Pipeline Flow (e.g. Preview Env)](#a-typical-pipeline-flow-e-g-preview-env)
   - [Environment Routing](#environment-routing)
-  - [🎯 Decision Matrix by Environment](#decision-matrix-by-environment)
+  - [Decision Matrix by Environment](#decision-matrix-by-environment)
 - [🐳 Docker Compose Support](#docker-compose-support)
   - [File Structure](#file-structure)
   - [How Docker Compose Works](#how-docker-compose-works)
-  - [Image Tagging & Reuse](#image-tagging--reuse)
+  - [Image Tagging & Reuse](#image-tagging-reuse)
 - [🔧 Configuration](#configuration)
-  - [Package.json Scripts (Node.js)](#packagejson-scripts-nodejs)
+  - [Package.json Scripts (Node.js)](#package-json-scripts-node-js)
   - [Python Requirements](#python-requirements)
   - [Dockerfile Best Practices](#dockerfile-best-practices)
   - [Environment-Scoped Build Arguments (static builds)](#environment-scoped-build-arguments-static-builds)
@@ -133,7 +133,7 @@ This pipeline library is designed with specific assumptions about your infrastru
   - [Automatic TLS](#automatic-tls)
   - [Dashboard Access](#dashboard-access)
   - [Preview Environments](#preview-environments)
-  - [Dev/UAT/Prod Routing](#devuatprod-routing)
+  - [Dev/UAT/Prod Routing](#dev-uat-prod-routing)
 - [🔐 Cloudflare Tunnel (Backend without Public IP)](#cloudflare-tunnel-backend-without-public-ip)
   - [Why Use Cloudflare Tunnel?](#why-use-cloudflare-tunnel)
   - [Cloudflare Tunnel Setup](#cloudflare-tunnel-setup)
@@ -154,9 +154,9 @@ This pipeline library is designed with specific assumptions about your infrastru
 - [🏷️ Repository Type Flags](#repository-type-flags)
   - [Repository Type Behavior](#repository-type-behavior)
 - [🔒 Admin Panel Security](#admin-panel-security)
-  - [**IP Whitelist Ranges:**](#ip-whitelist-ranges)
-  - [**How It Works:**](#how-it-works)
-  - [**Security Model:**](#security-model)
+  - [IP Whitelist Ranges](#ip-whitelist-ranges)
+  - [How It Works](#how-it-works)
+  - [Security Model](#security-model)
 - [📊 Quality Gates](#quality-gates)
   - [SonarQube Integration](#sonarqube-integration)
   - [Docker Scout](#docker-scout)
@@ -1017,18 +1017,18 @@ IS_ADMIN_PANEL=true     # Admin panel: rebuild flow, internal DNS in prod + IP w
 
 Admin panels (`IS_ADMIN_PANEL=true`) are automatically secured with IP whitelisting:
 
-### **IP Whitelist Ranges:**
+### IP Whitelist Ranges
 - `10.0.0.0/8` - Private Class A networks
 - `172.16.0.0/12` - Private Class B networks  
 - `192.168.0.0/16` - Private Class C networks
 
-### **How It Works:**
+### How It Works
 - **Automatic**: Pipeline detects `IS_ADMIN_PANEL=true` and applies IP restrictions
 - **Traefik Middleware**: Uses `admin-ip-whitelist` middleware for access control
 - **Internal Only**: Only accessible from internal/private networks
 - **Public Blocked**: External internet traffic is automatically blocked
 
-### **Security Model:**
+### Security Model
 ```
 admin.internal.example.com:
 ├── DNS: Internal BIND server → Internal IP
