@@ -122,8 +122,8 @@ This pipeline library is designed with specific assumptions about your infrastru
   - [🎯 Decision Matrix by Environment](#decision-matrix-by-environment)
 - [🐳 Docker Compose Support](#docker-compose-support)
   - [File Structure](#file-structure)
-  - [How It Works](#how-it-works)
-  - [Environment-Scoped Build Arguments (static builds)](#environment-scoped-build-arguments-static-builds)
+  - [How Docker Compose Works](#how-docker-compose-works)
+  - [Image Tagging & Reuse](#image-tagging--reuse)
 - [🔧 Configuration](#configuration)
   - [Package.json Scripts (Node.js)](#packagejson-scripts-nodejs)
   - [Python Requirements](#python-requirements)
@@ -136,14 +136,14 @@ This pipeline library is designed with specific assumptions about your infrastru
   - [Dev/UAT/Prod Routing](#devuatprod-routing)
 - [🔐 Cloudflare Tunnel (Backend without Public IP)](#cloudflare-tunnel-backend-without-public-ip)
   - [Why Use Cloudflare Tunnel?](#why-use-cloudflare-tunnel)
-  - [Setup](#setup)
+  - [Cloudflare Tunnel Setup](#cloudflare-tunnel-setup)
   - [Backend Docker Compose Requirements](#backend-docker-compose-requirements)
-  - [How It Works](#how-it-works)
+  - [How Cloudflare Tunnel Works](#how-cloudflare-tunnel-works)
   - [Frontend Integration](#frontend-integration)
-  - [Troubleshooting](#troubleshooting)
+  - [Cloudflare Tunnel Troubleshooting](#cloudflare-tunnel-troubleshooting)
 - [🔄 Cross-Repository Previews](#cross-repository-previews)
-  - [Setup](#setup)
-  - [Behavior](#behavior)
+  - [Cross-Repository Setup](#cross-repository-setup)
+  - [Cross-Repository Behavior](#cross-repository-behavior)
   - [Feature Gate](#feature-gate)
   - [Peer Host URLs Format](#peer-host-urls-format)
   - [Trigger Loop Prevention](#trigger-loop-prevention)
@@ -152,7 +152,7 @@ This pipeline library is designed with specific assumptions about your infrastru
   - [Tags](#tags)
 - [🚫 Stage Bypass Flags](#stage-bypass-flags)
 - [🏷️ Repository Type Flags](#repository-type-flags)
-  - [Behavior:](#behavior)
+  - [Repository Type Behavior](#repository-type-behavior)
 - [🔒 Admin Panel Security](#admin-panel-security)
   - [**IP Whitelist Ranges:**](#ip-whitelist-ranges)
   - [**How It Works:**](#how-it-works)
@@ -719,7 +719,7 @@ your-repo/
 ├── docker-compose.preview.yml  # Preview-specific overrides (optional)
 ```
 
-### How It Works
+### How Docker Compose Works
 1. **Base file**: `docker-compose.yml` is always used as foundation
 2. **Environment override**: `docker-compose.{env}.yml` if it exists
 3. **Pipeline override**: `docker-compose.override.yml` is auto-generated with:
@@ -727,10 +727,7 @@ your-repo/
    - Traefik labels (to route traffic for http/https based hostnames)
    - Environment-specific variables
 
-### Environment-Scoped Build Arguments (static builds)
-See Configuration → Environment-Scoped Build Arguments for full details.
-
-Image Tagging & Reuse
+### Image Tagging & Reuse
 - Build stage computes and writes image tags into `.env` (appended if present):
   - `DEV_TAG=$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-<short_commit>`
   - `UAT_TAG=$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:<release_tag>`
@@ -825,7 +822,7 @@ For production/UAT backend services that cannot rely on internal BIND DNS and ha
 - **Secure**: TLS termination at Cloudflare edge; tunnel traffic is encrypted.
 - **Simple**: No VPN or complex networking; just run cloudflared container.
 
-### Setup
+### Cloudflare Tunnel Setup
 
 For backend repos (`IS_BACKEND=true`), the `deploy-prod` step automatically:
 - Creates or reuses a Named Tunnel via Cloudflare API.
@@ -868,7 +865,7 @@ services:
       - "8000:8000"  # Auto-published for Cloudflare Tunnel
 ```
 
-### How It Works
+### How Cloudflare Tunnel Works
 
 1. **Pipeline runs `deploy-prod` step** for backend repo (`IS_BACKEND=true`).
 2. **Deploy checks if tunnel is running**; if not, auto-runs setup script.
@@ -886,7 +883,7 @@ services:
 - **Via Traefik**: FE Traefik proxies to `https://be-api.prod.example.com` (see Traefik Integration for routing setup).
 - **Via Kong**: Kong proxies to `https://be-api.prod.example.com`.
 
-### Troubleshooting
+### Cloudflare Tunnel Troubleshooting
 
 #### "APP_PORT is not set"
 - **Cause**: Neither `APP_PORT` nor `TUNNEL_SERVICE_URL` provided.
@@ -908,7 +905,7 @@ services:
 
 Enable peer previews for frontend/backend coordination:
 
-### Setup
+### Cross-Repository Setup
 ```bash
 # In your repo variables
 PEER_REPO_SLUGS=frontend-repo,backend-repo
@@ -919,7 +916,7 @@ Note on where to set PEER_HOST_URLS
 - Preview flow (static repos): set as Repository variables so values are available at build time.
 - Preview flow (dynamic repos): set under the `preview` Deployment environment variables so PRs can override per-run.
 
-### Behavior
+### Cross-Repository Behavior
 - **Automatic triggers**: Peer repos deploy when source repo builds
 - **URL sharing**: Cross-service URLs automatically computed
 - **Isolation**: Each repo maintains separate preview environment
@@ -1004,7 +1001,7 @@ IS_BACKEND=true         # Backend repo: promote flow, Cloudflare Tunnel in prod
 IS_ADMIN_PANEL=true     # Admin panel: rebuild flow, internal DNS in prod + IP whitelist
 ```
 
-### Behavior:
+### Repository Type Behavior
 
 **UAT Environment:**
 - All repos: Traefik routing + internal DNS
