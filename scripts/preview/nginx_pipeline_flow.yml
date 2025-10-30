@@ -1,0 +1,206 @@
+ # For preview environments using Nginx (Currently using traefik in main pipeline)
+    - step: &setup-preview-nginx
+        name: 🌐 Setup Nginx (One-time setup)
+        clone: 
+          enabled: true
+          depth: 1
+        clone-workspace: true
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+            
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            echo "PR_ID_FOR_USE=${PR_ID_FOR_USE}" >> .env
+            
+            # Only run preview deployment for PRs targeting develop/dev/main/release/*
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "main" ] && [[ ! "${BITBUCKET_PR_DESTINATION_BRANCH}" =~ ^release/ ]]; }; }; then
+              echo "Skipping preview deployment: no PR context or PR not targeting develop/dev/main/release/*"
+              exit 0
+            fi
+
+            # If Dockerfile includes Nginx, skip the Nginx setup
+            if [ -f "Dockerfile" ] && grep -q "nginx" Dockerfile 2>/dev/null; then
+              echo "Dockerfile includes Nginx - skipping separate Nginx setup"
+              exit 0
+            fi
+
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Specifically ensure the nginx script is executable
+            chmod +x shared-pipelines/scripts/preview/install_or_update_preview_proxy.sh || {
+              echo "ERROR: Failed to make nginx script executable"
+              exit 1
+            }
+            
+            echo "Running nginx setup script..."
+            INTERNAL_DNS_ZONE="internal.${PREVIEW_DOMAIN_NAME}" ./shared-pipelines/scripts/preview/install_or_update_preview_proxy.sh || {
+              echo "ERROR: Nginx setup script failed"
+              exit 1
+            }
+            
+            echo "✅ Nginx preview proxy configured/verified successfully"
+
+    - step: &deploy-preview-nginx
+        name: 👀 Deploy Preview (PR → develop)
+        clone: 
+          enabled: true
+          depth: 1
+        clone-workspace: true
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        deployment: preview
+        script:
+          - |
+            # Skip preview deployment unless:
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            # Only run preview deployment for PRs targeting develop/dev/main/release/*
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "main" ] && [[ ! "${BITBUCKET_PR_DESTINATION_BRANCH}" =~ ^release/ ]]; }; }; then
+              echo "Skipping preview deployment: no PR context or PR not targeting develop/dev/main/release/*"
+              exit 0
+            fi
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Allocate a free preview port within fixed range
+            chmod +x shared-pipelines/scripts/preview/allocate_port.sh || {
+              echo "ERROR: Failed to make allocate_port script executable"
+              exit 1
+            }
+            PREVIEW_PORT_START=${PREVIEW_PORT_START:-40000} PREVIEW_PORT_SIZE=${PREVIEW_PORT_SIZE:-25} \
+            ./shared-pipelines/scripts/preview/allocate_port.sh
+            export PORT=$(cat preview_port.txt)
+            # set value of APP_PORT to PORT
+            export APP_PORT=${PORT}
+            echo "APP_PORT=${APP_PORT}" >> .env
+
+            # Compose up for preview
+            export COMPOSE_PROJECT_NAME="${PREVIEW_SLUG}"
+
+            if [ -f "Dockerfile" ] && grep -q "nginx" Dockerfile 2>/dev/null; then
+              export SERVER_NAME="${PREVIEW_SLUG}.internal.${PREVIEW_DOMAIN_NAME}"
+              echo "SERVER_NAME=${SERVER_NAME}" >> .env
+            else
+              echo "Dockerfile does not include Nginx - so continue without setting SERVER_NAME for Nginx"
+            fi
+            
+            # Clean up any existing containers with the same project name
+            docker compose -f docker-compose.prod.yml down || true
+            
+            cat > docker-compose.override.yml << 'COMPOSE_EOF'
+            services:
+              app:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env  
+            COMPOSE_EOF
+
+            echo "================================================"
+            cat .env
+            echo "================================================"
+            
+            docker compose -f docker-compose.preview.yml -f docker-compose.override.yml up -d
+            sleep 10
+            
+            # Enable Nginx site
+            INTERNAL_DNS_ZONE="internal.${PREVIEW_DOMAIN_NAME}" ./shared-pipelines/scripts/preview/nginx_enable_site.sh || true
+
+            # PR comment
+            if [ -n "$BITBUCKET_ACCESS_TOKEN" ]; then
+              echo "Using OAuth access token for PR comment"
+              export BITBUCKET_REPO_OWNER=${BITBUCKET_REPO_OWNER:-$BITBUCKET_WORKSPACE}
+              export BITBUCKET_REPO_SLUG=${BITBUCKET_REPO_SLUG:-$BITBUCKET_REPO_SLUG}
+              export PREVIEW_URL="http://${PREVIEW_SLUG}.internal.${PREVIEW_DOMAIN_NAME}"
+              ./shared-pipelines/scripts/preview/pr_comment.sh || true
+            else
+              echo "No Bitbucket credentials found: set BITBUCKET_ACCESS_TOKEN (OAuth access token)"
+            fi
+
+    - step: &teardown-preview-nginx
+        name: 🧹 Teardown Preview (PR closed/merged)
+        clone: 
+          enabled: true
+        clone-workspace: true
+        trigger: manual
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            if [ -z "$PR_ID_FOR_USE" ]; then
+              echo "No PR context; skipping preview teardown."
+              exit 0
+            fi
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Compose down for preview
+            export COMPOSE_PROJECT_NAME="${PREVIEW_SLUG}"
+            
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            docker compose -f docker-compose.prod.yml down || true
+            
+            INTERNAL_DNS_ZONE="internal.${PREVIEW_DOMAIN_NAME}" ./shared-pipelines/scripts/preview/nginx_disable_site.sh || true
+ 

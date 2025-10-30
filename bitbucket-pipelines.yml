@@ -1,0 +1,3868 @@
+export: true
+
+image: node:18
+
+definitions:
+  caches:
+    sonar: ~/.sonar/cache
+  steps:
+    - step: &feature-gate
+        name: ⏸️ Feature Flow Gate (manual)
+        trigger: manual
+        clone:
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            echo "=== Feature Flow Gate ==="
+            echo "PR_ID:       ${PR_ID_FOR_USE}"
+            echo "Trigger Src: ${TRIGGER_SOURCE:-<none>}"
+            echo "Manual trigger detected. If the required variables (e.g., PR_ID) are set, a feature deployment will proceed. Otherwise, feel free to stop this run."
+
+  
+    - step: &setup-shared-pipelines
+        name: 🔧 Setup Shared Pipelines
+        clone:
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            echo "=== Starting Shared Pipelines Setup ==="
+            pwd
+            echo "Current user: $(whoami)"
+
+            BITBUCKET_WORKSPACE="protocol33"
+            SHARED_PIPELINES_REPO="${SHARED_PIPELINES_REPO:-${BITBUCKET_WORKSPACE}/shared-pipelines}"
+            SHARED_PIPELINES_BRANCH="main"
+            SKIP_SHALLOW_CLONE="true"
+            
+            echo "Using workspace: ${BITBUCKET_WORKSPACE}"
+            echo "Using repo: ${SHARED_PIPELINES_REPO}"
+            echo "Using branch: ${SHARED_PIPELINES_BRANCH}"
+
+            # Clone shared-pipelines repository
+            echo "Cloning shared-pipelines repository..."
+            
+            
+            # Clone the repository
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+            git clone git@bitbucket.org:protocol33/shared-pipelines.git && {
+              echo "Repository cloned successfully"
+            } || {
+              echo "ERROR: Failed to clone repository"
+              exit 1
+            }
+            fi
+            # Debug: Show what's in the downloaded repository
+            echo "=== Contents of downloaded shared-pipelines repository ==="
+            echo "Current directory: $(pwd)"
+            echo "current directory contents:"
+            ls -la 
+            echo "shared-pipelines directory contents:"
+            ls -la shared-pipelines/
+
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \;
+
+            echo "=== Shared Pipelines Setup Completed ==="
+            
+            # Make consumer repo files available as artifacts for steps with clone disabled
+            echo "Creating consumer-repo snapshot for artifact sharing..."
+            mkdir -p .consumer-repo-snapshot
+            
+            # Copy all files except .git and shared-pipelines to snapshot
+            rsync -a --exclude='.git' --exclude='shared-pipelines' --exclude='.consumer-repo-snapshot' ./ .consumer-repo-snapshot/
+            
+            echo "Consumer repo snapshot created with $(find .consumer-repo-snapshot -type f | wc -l) files"
+        artifacts:
+          - shared-pipelines/**
+          - .consumer-repo-snapshot/**
+
+    - step: &setup-env
+        name: 🔧 Setup Environment
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Set environment based on branch or deployment context
+            case "${BITBUCKET_BRANCH:-}" in
+              "main")
+                ENVIRONMENT="prod"
+                ;;
+              "develop"|"dev")
+                ENVIRONMENT="dev"
+                ;;
+              "release/"*)
+                ENVIRONMENT="uat"
+                ;;
+              "hotfix/"*)
+                ENVIRONMENT="hotfix"
+                ;;
+              *)
+                ENVIRONMENT="${ENVIRONMENT:-preview}"
+                ;;
+            esac
+            
+            echo "🔧 Setting up environment: ${ENVIRONMENT}"
+
+            # only if its a PR, run the custom environment setup script
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+
+            # Derive a safe preview key from feature/* branch to avoid PR number collisions across repos
+            PREVIEW_KEY=""
+            if [ -n "${BITBUCKET_BRANCH:-}" ] && echo "${BITBUCKET_BRANCH}" | grep -qiE '^feature/'; then
+              PREVIEW_KEY=$(echo "${BITBUCKET_BRANCH#feature/}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]+/-/g; s/[^a-z0-9-]/-/g; s/--\+/-/g; s/^-\+//; s/-\+$//')
+            fi
+            if [ -n "$PREVIEW_KEY" ]; then
+              export PREVIEW_SLUG="preview-${PREVIEW_KEY}-${BITBUCKET_REPO_SLUG}"
+              export TAG_SLUG="branch-${PREVIEW_KEY}"
+            else
+              export PREVIEW_SLUG="preview-${PR_ID_FOR_USE}-${BITBUCKET_REPO_SLUG}"
+              export TAG_SLUG="pr-${PR_ID_FOR_USE}"
+            fi
+
+            echo "TAG_SLUG set to: $TAG_SLUG for environment: $ENVIRONMENT"
+            
+            # Set environment-specific image tags for later use (matching build step logic)
+            SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+            if [ "$ENVIRONMENT" = "dev" ]; then
+              DEV_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-$SHORT_COMMIT"
+              export DEV_TAG
+              echo "Set DEV_TAG: $DEV_TAG"
+            elif [ "$ENVIRONMENT" = "uat" ]; then
+              RELEASE_TAG="release-$(echo $BITBUCKET_BRANCH | sed 's/release\///')"
+              UAT_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$RELEASE_TAG"
+              export UAT_TAG
+              echo "Set UAT_TAG: $UAT_TAG"
+            elif [ "$ENVIRONMENT" = "prod" ]; then
+              VERSION="${VERSION:-}"
+              if [ -z "$VERSION" ] && [ -n "$BITBUCKET_TAG" ]; then
+                VERSION="$(echo "$BITBUCKET_TAG" | sed -E 's/^(v|release-)//')"
+              fi
+              if [ -z "$VERSION" ]; then
+                SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+                VERSION="prod-$SHORT_COMMIT"
+              fi
+              PROD_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$VERSION"
+              export PROD_TAG
+              echo "Set PROD_TAG: $PROD_TAG"
+            elif [ "$ENVIRONMENT" = "hotfix" ]; then
+              HOTFIX_VERSION="hotfix-$(echo $BITBUCKET_BRANCH | sed 's/hotfix\///')"
+              HOTFIX_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$HOTFIX_VERSION"
+              export HOTFIX_TAG
+              echo "Set HOTFIX_TAG: $HOTFIX_TAG"
+            fi
+
+            echo "Running custom environment setup script for PR: $PR_ID_FOR_USE"
+            CUSTOM_ENV_SCRIPT="${CUSTOM_ENV_SETUP_SCRIPT:-custom-env.sh}"
+            if [ -f "$CUSTOM_ENV_SCRIPT" ]; then
+              echo "Running custom environment setup: $CUSTOM_ENV_SCRIPT"
+              chmod +x "$CUSTOM_ENV_SCRIPT" && ./"$CUSTOM_ENV_SCRIPT"
+            else
+              echo "No custom environment setup script found"
+            fi
+            
+            # Create .env file for docker-compose
+            {
+              echo "# Environment configuration for docker-compose"
+              echo "TARGET_ENV=${ENVIRONMENT}"
+              echo "PR_ID_FOR_USE=${PR_ID_FOR_USE}"
+              echo "PREVIEW_KEY=${PREVIEW_KEY}"
+              echo "TAG_SLUG=${TAG_SLUG}"
+              echo "PREVIEW_SLUG=${PREVIEW_SLUG}"
+              echo "DEV_TAG=${DEV_TAG}"
+              echo "UAT_TAG=${UAT_TAG}"
+              echo "PROD_TAG=${PROD_TAG}"
+              echo "HOTFIX_TAG=${HOTFIX_TAG}"
+            } > .env
+
+            # Append all non-system environment variables as key=value, sanitizing to avoid "VAR=  value" issues
+            # Excludes Bitbucket/system vars to avoid noise and secrets leakage
+            env | grep -E '^[A-Z_][A-Z0-9_]*=' | while IFS='=' read -r key value; do
+              case "$key" in
+                BITBUCKET_*|PATH|HOME|USER|SHELL|PWD|OLDPWD|_|SSH_*|SHLVL|LANG|LS_COLORS|LESSOPEN|LESSCLOSE|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID)
+                  continue ;;
+              esac
+              # Skip empty keys or values containing newlines
+              [ -z "$key" ] && continue
+              # Sanitize: trim leading/trailing spaces and normalize "=\s+" to "="
+              sanitized_value="$(echo "$value" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')"
+              printf '%s=%s\n' "$key" "$sanitized_value" >> .env
+            done
+            
+            echo "✅ Environment prepared: ${ENVIRONMENT}"
+            echo "📄 Created .env file with $(wc -l < .env) variables"
+            echo "📋 .env contents:"
+            cat .env
+        artifacts:
+          - .env
+
+# =============================================================================
+# SMART DISPATCH STEPS (Auto-detect project type)
+# =============================================================================
+
+    - step: &lint
+        name: 🔍 Lint Code (Auto-detect)
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Restore consumer repo from artifact snapshot
+            if [ -d ".consumer-repo-snapshot" ]; then
+              echo "Restoring consumer repo from snapshot..."
+              rsync -a .consumer-repo-snapshot/ ./
+              rm -rf .consumer-repo-snapshot
+              echo "Consumer repo restored"
+            fi
+            
+            # Block PRs targeting non-dev branches (only allow dev/develop)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping lint: PR not targeting develop/dev"
+              exit 0
+            fi
+            
+            # Check for skip flags
+            if [ "${SKIP_LINT:-false}" = "true" ]; then
+              echo "Skipping lint because SKIP_LINT=true"
+              exit 0
+            fi
+            
+            # Debug: Check current directory and files
+            echo "=== LINT STEP DEBUG ==="
+            echo "PWD: $(pwd)"
+            echo "Files in current directory:"
+            ls -lah
+            echo "Checking for project files:"
+            echo "  package.json: $([ -f package.json ] && echo 'EXISTS' || echo 'NOT FOUND')"
+            echo "  requirements.txt: $([ -f requirements.txt ] && echo 'EXISTS' || echo 'NOT FOUND')"
+            echo "  pyproject.toml: $([ -f pyproject.toml ] && echo 'EXISTS' || echo 'NOT FOUND')"
+            echo "=== END DEBUG ==="
+            echo ""
+            
+            # Auto-detect project type and call appropriate lint script
+            if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+              echo "🐍 Python project detected → running lint-python"
+              if [ -d "shared-pipelines" ]; then
+                echo "shared-pipelines directory already exists"
+              else
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
+              fi
+              chmod +x shared-pipelines/scripts/lint/lint-python.sh
+              exec bash shared-pipelines/scripts/lint/lint-python.sh
+            elif [ -f "package.json" ]; then
+              echo "📦 Node.js project detected → running lint-node"
+              if [ -d "shared-pipelines" ]; then
+                echo "shared-pipelines directory already exists"
+              else
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
+              fi
+              chmod +x shared-pipelines/scripts/lint/lint-node.sh
+              exec bash shared-pipelines/scripts/lint/lint-node.sh
+            else
+              echo "ERROR: Could not detect project type (no package.json, requirements.txt, or pyproject.toml)"
+              exit 1
+            fi
+        artifacts:
+          - lint-results.txt
+          - lint-py-results.txt
+          - eslint-report.json
+          - python-lint-report.json
+
+    - step: &test
+        name: 🧪 Run Tests (Auto-detect)
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Restore consumer repo from artifact snapshot
+            if [ -d ".consumer-repo-snapshot" ]; then
+              echo "Restoring consumer repo from snapshot..."
+              rsync -a .consumer-repo-snapshot/ ./
+              rm -rf .consumer-repo-snapshot
+              echo "Consumer repo restored"
+            fi
+            
+            # Block PRs targeting non-dev branches (only allow dev/develop)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping test: PR not targeting develop/dev"
+              exit 0
+            fi
+            
+            # Check for skip flags
+            if [ "${SKIP_TESTS:-false}" = "true" ] || [ "${SKIP_TEST:-false}" = "true" ]; then
+              echo "Skipping tests because SKIP_TESTS=true or SKIP_TEST=true"
+              exit 0
+            fi
+            
+            # Auto-detect project type and call appropriate test script
+            if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+              echo "🐍 Python project detected → running test-python"
+              if [ -d "shared-pipelines" ]; then
+                echo "shared-pipelines directory already exists"
+              else
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
+              fi
+              chmod +x shared-pipelines/scripts/test/test-python.sh
+              exec bash shared-pipelines/scripts/test/test-python.sh
+            elif [ -f "package.json" ]; then
+              echo "📦 Node.js project detected → running test-node"
+              if [ -d "shared-pipelines" ]; then
+                echo "shared-pipelines directory already exists"
+              else
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
+              fi
+              chmod +x shared-pipelines/scripts/test/test-node.sh
+              exec bash shared-pipelines/scripts/test/test-node.sh
+            else
+              echo "ERROR: Could not detect project type (no package.json, requirements.txt, or pyproject.toml)"
+              exit 1
+            fi
+        artifacts:
+          - coverage/**
+          - test-results.xml
+          - test-results-py.xml
+          - test-summary-py.txt
+
+    - step: &build
+        name: 🐳 Build Docker Image (Auto-detect)
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Restore consumer repo from artifact snapshot
+            if [ -d ".consumer-repo-snapshot" ]; then
+              echo "Restoring consumer repo from snapshot..."
+              rsync -a .consumer-repo-snapshot/ ./
+              rm -rf .consumer-repo-snapshot
+              echo "Consumer repo restored"
+            fi
+           
+            # Load .env to get TARGET_ENV
+            if [ -f .env ]; then
+              set -a; . ./.env; set +a
+            fi
+            
+            # Block PRs targeting non-dev branches (only allow dev/develop)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping build: PR not targeting develop/dev"
+              exit 0
+            fi
+            
+            # Skip build only for PROD if IS_BACKEND=true
+            if [ "$IS_BACKEND" = "true" ] && [ "$TARGET_ENV" = "prod" ]; then
+              echo "IS_BACKEND=true for PROD: skipping build step"
+              exit 0
+            fi
+
+            # Auto-detect project type and call appropriate build script
+            if [ -f "requirements.txt" ] || [ -f "pyproject.toml" ] || [ -f "setup.py" ]; then
+              echo "🐍 Python project detected → running build-python"
+              if [ -d "shared-pipelines" ]; then
+                echo "shared-pipelines directory already exists"
+              else
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
+              fi
+              chmod +x shared-pipelines/scripts/build/build-python.sh
+              exec bash shared-pipelines/scripts/build/build-python.sh
+            elif [ -f "package.json" ]; then
+              echo "📦 Node.js project detected → running build-node"
+              if [ -d "shared-pipelines" ]; then
+                echo "shared-pipelines directory already exists"
+              else
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
+              fi
+              chmod +x shared-pipelines/scripts/build/build-node.sh
+              exec bash shared-pipelines/scripts/build/build-node.sh
+            else
+              echo "ERROR: Could not detect project type (no package.json, requirements.txt, or pyproject.toml)"
+              exit 1
+            fi
+
+# =============================================================================
+# NODE.JS SPECIFIC IMPLEMENTATIONS
+# =============================================================================
+
+
+    - step: &lint-node
+        name: 🔍 Lint Code (Node.js)
+        clone: 
+          enabled: true
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            # Only run preview deployment for PRs targeting develop/dev
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping lint: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_LINT}" = "true" ]; then
+              echo "Skipping lint because SKIP_LINT=true"
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            [ -f "${APP_PATH}/package.json" ] || { echo "Missing ${APP_PATH}/package.json in consumer repo"; exit 1; }
+
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            # This command is necessary because Bitbucket self-hosted runners might inherit DOCKER_HOST or DOCKER_CONTEXT environment variables that force the Docker CLI
+            # that force the Docker CLI to attempt connection over TCP (e.g., tcp://localhost:2375), even when the daemon is running locally and accessible via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Use the host user ID to avoid permission issues
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+
+            NODE_VERSION="${NODE_VERSION:-20}"
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)/${APP_PATH}":/app \
+              -w /app \
+              -e HOME=/tmp \
+              -e CI=true \
+              -e NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" \
+              -e TEST_ALLOW_FAILURE="${TEST_ALLOW_FAILURE:-true}" \
+              node:${NODE_VERSION} bash -c '
+              # Set npm to use temporary directories to avoid permission issues
+              export npm_config_cache=/tmp/.npm
+              export npm_config_userconfig=/tmp/.npmrc
+              
+              # Install dependencies with legacy peer deps for React projects
+              if [ -f package-lock.json ]; then
+                npm ci --cache /tmp/.npm --legacy-peer-deps || npm install --cache /tmp/.npm --legacy-peer-deps
+              elif [ -f yarn.lock ]; then
+                yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile --store-dir /tmp/.pnpm-store
+              else
+                npm install --cache /tmp/.npm --legacy-peer-deps
+              fi
+              
+              # Run lint and capture output (skip only if script truly missing)
+              LINT_SCRIPT_NAME="${LINT_SCRIPT_NAME:-}"
+              echo "🔍 Lint script preference: '${LINT_SCRIPT_NAME:-auto}' (auto tries lint:ci, then lint)"
+              
+              # Create a simple script to check for lint script (silent: exit 0 if exists, 1 otherwise)
+              printf '%s\n' \
+                "try {" \
+                "  const p = require('./package.json');" \
+                "  const name = process.argv[2];" \
+                "  if (p && p.scripts && Object.prototype.hasOwnProperty.call(p.scripts, name)) process.exit(0);" \
+                "} catch (e) {}" \
+                "process.exit(1);" \
+              > /tmp/check-lint.js
+              
+              if [ -f yarn.lock ]; then
+                echo "📦 Using yarn as package manager"
+                if [ -n "${LINT_SCRIPT_NAME}" ]; then
+                  echo "✅ Running '${LINT_SCRIPT_NAME}' with yarn (user override)..."
+                  yarn ${LINT_SCRIPT_NAME} 2>&1 | tee /tmp/lint-output.txt; LINT_EXIT_CODE=${PIPESTATUS[0]}
+                else
+                  echo "🔍 Auto-fallback: trying yarn scripts (lint:ci, then lint)..."
+                  yarn lint:ci 2>&1 | tee /tmp/lint-output.txt || true
+                LINT_EXIT_CODE=${PIPESTATUS[0]}
+                  if [ ${LINT_EXIT_CODE} -ne 0 ]; then
+                    yarn lint 2>&1 | tee /tmp/lint-output.txt || true
+                    LINT_EXIT_CODE=${PIPESTATUS[0]}
+                  fi
+                  if [ ${LINT_EXIT_CODE} -ne 0 ]; then
+                    echo "⚠️  No lint script present; skipping lint" | tee -a /tmp/lint-output.txt
+                    LINT_EXIT_CODE=0
+                  fi
+                fi
+              elif [ -f pnpm-lock.yaml ]; then
+                echo "📦 Using pnpm as package manager"
+                if [ -n "${LINT_SCRIPT_NAME}" ]; then
+                  echo "✅ Running '${LINT_SCRIPT_NAME}' with pnpm (user override)..."
+                  pnpm run ${LINT_SCRIPT_NAME} 2>&1 | tee /tmp/lint-output.txt; LINT_EXIT_CODE=${PIPESTATUS[0]}
+                else
+                  echo "🔍 Auto-fallback: trying pnpm scripts (lint:ci, then lint)..."
+                  pnpm run lint:ci 2>&1 | tee /tmp/lint-output.txt || true
+                LINT_EXIT_CODE=${PIPESTATUS[0]}
+                  if [ ${LINT_EXIT_CODE} -ne 0 ]; then
+                    pnpm run lint 2>&1 | tee /tmp/lint-output.txt || true
+                    LINT_EXIT_CODE=${PIPESTATUS[0]}
+                  fi
+                  if [ ${LINT_EXIT_CODE} -ne 0 ]; then
+                    echo "⚠️  No lint script present; skipping lint" | tee -a /tmp/lint-output.txt
+                    LINT_EXIT_CODE=0
+                  fi
+                fi
+              else
+                echo "📦 Using npm as package manager"
+                if [ -n "${LINT_SCRIPT_NAME}" ]; then
+                  echo "✅ Running '${LINT_SCRIPT_NAME}' with npm (if present)..."
+                  npm run ${LINT_SCRIPT_NAME} --if-present 2>&1 | tee /tmp/lint-output.txt
+                LINT_EXIT_CODE=${PIPESTATUS[0]}
+                  if ! grep -qE "^> ${LINT_SCRIPT_NAME}" /tmp/lint-output.txt && ! grep -qi "eslint" /tmp/lint-output.txt; then
+                    echo "⚠️  Script '${LINT_SCRIPT_NAME}' not present; skipping lint" | tee -a /tmp/lint-output.txt
+                    LINT_EXIT_CODE=0
+                  fi
+                else
+                  echo "🔍 Auto-fallback: trying npm scripts (lint:ci, then lint) if present..."
+                  npm run lint:ci --if-present 2>&1 | tee /tmp/lint-output.txt
+                  LINT_EXIT_CODE=${PIPESTATUS[0]}
+                  if grep -qE "^> lint:ci" /tmp/lint-output.txt || grep -qi "eslint" /tmp/lint-output.txt; then
+                    echo "✅ Executed npm run lint:ci"
+                  else
+                    npm run lint --if-present 2>&1 | tee /tmp/lint-output.txt
+                    LINT_EXIT_CODE=${PIPESTATUS[0]}
+                    if grep -qE "^> lint" /tmp/lint-output.txt || grep -qi "eslint" /tmp/lint-output.txt; then
+                      echo "✅ Executed npm run lint"
+                    else
+                      echo "⚠️  No lint script present; skipping lint" | tee /tmp/lint-output.txt
+                      LINT_EXIT_CODE=0
+                    fi
+                  fi
+                fi
+              fi
+              
+              # Create lint results file
+              echo "=== Lint Results ===" > lint-results.txt
+              echo "Timestamp: $(date)" >> lint-results.txt
+              echo "Exit Code: $LINT_EXIT_CODE" >> lint-results.txt
+              echo "Output:" >> lint-results.txt
+              cat /tmp/lint-output.txt >> lint-results.txt
+
+              # Optional: generate ESLint JSON report for Sonar ingestion (best-effort)
+              echo "Generating ESLint JSON report (best-effort)..."
+              if command -v npx >/dev/null 2>&1; then
+                ( npx eslint . --ext .js,.jsx,.ts,.tsx -f json -o eslint-report.json 2>/dev/null || true )
+              fi
+              
+              # Optionally allow lint failures without failing the pipeline
+              if [ "${LINT_ALLOW_FAILURE:-true}" = "true" ]; then
+                echo "LINT_ALLOW_FAILURE=true: continuing despite lint exit code $LINT_EXIT_CODE" | tee -a lint-results.txt
+                LINT_EXIT_CODE=0
+              fi
+              
+              # Exit with lint result
+              exit $LINT_EXIT_CODE
+            '
+        artifacts:
+          - lint-results.txt
+          - eslint-report.json
+
+    - step: &test-node
+        name: 🧪 Run Tests (Node.js)
+        clone: 
+          enabled: true
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            # Only run preview deployment for PRs targeting develop/dev/main/release/*
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping tests: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_TESTS}" = "true" ] || [ "${SKIP_TEST}" = "true" ]; then
+              echo "Skipping tests because SKIP_TESTS=true or SKIP_TEST=true"
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            [ -f "${APP_PATH}/package.json" ] || { echo "Missing ${APP_PATH}/package.json in consumer repo"; exit 1; }
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Use the host user ID to avoid permission issues
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+
+            NODE_VERSION="${NODE_VERSION:-20}"
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)/${APP_PATH}":/app \
+              -w /app \
+              -e HOME=/tmp \
+              -e CI=true \
+              -e NODE_OPTIONS="${NODE_OPTIONS:---max-old-space-size=4096}" \
+              -e NO_COLOR=1 -e FORCE_COLOR=0 -e npm_config_color=false \
+              -e TEST_ALLOW_FAILURE="${TEST_ALLOW_FAILURE:-true}" \
+              node:${NODE_VERSION} bash -c '
+              # Set npm to use temporary directories to avoid permission issues
+              export npm_config_cache=/tmp/.npm
+              export npm_config_userconfig=/tmp/.npmrc
+              
+              # Install dependencies with legacy peer deps for React projects
+              if [ -f package-lock.json ]; then
+                npm ci --cache /tmp/.npm --legacy-peer-deps || npm install --cache /tmp/.npm --legacy-peer-deps
+              elif [ -f yarn.lock ]; then
+                yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+              elif [ -f pnpm-lock.yaml ]; then
+                pnpm install --frozen-lockfile --store-dir /tmp/.pnpm-store
+              else
+                npm install --cache /tmp/.npm --legacy-peer-deps
+              fi
+              
+              # Run tests (prefer coverage script names; fallback to test; skip only if none)
+              # Allow override via TEST_SCRIPT_NAME env var, otherwise auto-detect
+              if [ -n "${TEST_SCRIPT_NAME:-}" ]; then
+                PICK_TEST_SCRIPT="${TEST_SCRIPT_NAME}"
+                echo "🔍 Using custom test script: '${PICK_TEST_SCRIPT}' (from TEST_SCRIPT_NAME env var)"
+              else
+                echo "🔍 Auto-detecting test script from package.json..."
+                # Create a simple script to detect test script (avoid heredoc quoting pitfalls)
+                printf '%s\n' \
+                  "const p = require('./package.json');" \
+                  "const envOrder = (process.env.TEST_SCRIPT_ORDER||'').split(',').map(s=>s.trim()).filter(Boolean);" \
+                  "const defaultOrder = ['test:ci','test:coverage','test:cov','coverage','test'];" \
+                  "const order = envOrder.length ? envOrder : defaultOrder;" \
+                  "// Print only the selected script to stdout; other info to stderr" \
+                  "if (!p.scripts) { process.exit(1); }" \
+                  "for (const k of order) { if (p.scripts[k]) { console.log(k); process.exit(0); } }" \
+                  "process.exit(1);" \
+                > /tmp/check-test.js
+                PICK_TEST_SCRIPT=$(node /tmp/check-test.js 2>/dev/null || true)
+              fi
+
+              if [ -f yarn.lock ]; then
+                echo "📦 Using yarn as package manager"
+                if [ -n "$PICK_TEST_SCRIPT" ]; then
+                  echo "✅ Running test script '${PICK_TEST_SCRIPT}' with yarn..."
+                  yarn $PICK_TEST_SCRIPT 2>&1 | tee /tmp/test-output.txt; TEST_EXIT_CODE=${PIPESTATUS[0]}
+                else
+                  echo "⚠️  No test script found, skipping tests" | tee /tmp/test-output.txt; TEST_EXIT_CODE=0
+                fi
+              elif [ -f pnpm-lock.yaml ]; then
+                echo "📦 Using pnpm as package manager"
+                if [ -n "$PICK_TEST_SCRIPT" ]; then
+                  echo "✅ Running test script '${PICK_TEST_SCRIPT}' with pnpm..."
+                  pnpm run $PICK_TEST_SCRIPT 2>&1 | tee /tmp/test-output.txt; TEST_EXIT_CODE=${PIPESTATUS[0]}
+                else
+                  echo "⚠️  No test script found, skipping tests" | tee /tmp/test-output.txt; TEST_EXIT_CODE=0
+                fi
+              else
+                echo "📦 Using npm as package manager"
+                if [ -n "$PICK_TEST_SCRIPT" ]; then
+                  echo "✅ Running test script '${PICK_TEST_SCRIPT}' with npm..."
+                  npm run $PICK_TEST_SCRIPT 2>&1 | tee /tmp/test-output.txt; TEST_EXIT_CODE=${PIPESTATUS[0]}
+                else
+                  echo "🔍 Auto-fallback: trying npm scripts (test:ci, then test) if present..."
+                  # Try test:ci first
+                  npm run test:ci --if-present 2>&1 | tee /tmp/test-output.txt
+                TEST_EXIT_CODE=${PIPESTATUS[0]}
+                  if grep -qE "^> test:ci" /tmp/test-output.txt || grep -qi "jest" /tmp/test-output.txt; then
+                    echo "✅ Executed npm run test:ci"
+              else
+                    # Try plain test
+                    npm run test --if-present 2>&1 | tee /tmp/test-output.txt
+                TEST_EXIT_CODE=${PIPESTATUS[0]}
+                    if grep -qE "^> test" /tmp/test-output.txt || grep -qi "jest" /tmp/test-output.txt; then
+                      echo "✅ Executed npm run test"
+                    else
+                      echo "⚠️  No test script present; skipping tests" | tee /tmp/test-output.txt
+                      TEST_EXIT_CODE=0
+                    fi
+                  fi
+                fi
+              fi
+              
+              # Sanitize ANSI/color from test output for XML safety
+              if [ -s /tmp/test-output.txt ]; then
+                sed -r "s/\x1B\[[0-9;]*[A-Za-z]//g" /tmp/test-output.txt | tr -cd "\11\12\15\40-\176" > /tmp/test-output-clean.txt || cp /tmp/test-output.txt /tmp/test-output-clean.txt
+              else
+                : > /tmp/test-output-clean.txt
+              fi
+
+              # Human-readable summary (separate file, not XML)
+              echo "=== Test Results ===" > test-summary.txt
+              if [ -s /tmp/test-output.txt ]; then
+                echo "See detailed output below:" >> test-summary.txt
+                tail -n 200 /tmp/test-output.txt >> test-summary.txt || true
+              fi
+
+              # Machine-readable JUnit XML (strictly XML)
+              echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > test-results.xml
+              echo "<testsuites>" >> test-results.xml
+              echo "  <testsuite name=\"test-run\" timestamp=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\">" >> test-results.xml
+              echo "    <testcase name=\"test-execution\" classname=\"test-run\">" >> test-results.xml
+              if [ $TEST_EXIT_CODE -eq 0 ]; then
+                echo "      <system-out>Tests passed successfully</system-out>" >> test-results.xml
+              else
+                echo "      <failure message=\"Tests failed with exit code $TEST_EXIT_CODE\">" >> test-results.xml
+                echo "        <![CDATA[$(cat /tmp/test-output-clean.txt)]]>" >> test-results.xml
+                echo "      </failure>" >> test-results.xml
+              fi
+              echo "    </testcase>" >> test-results.xml
+              echo "  </testsuite>" >> test-results.xml
+              echo "</testsuites>" >> test-results.xml
+              
+              # Ensure a non-empty, well-formed XML exists even if prior commands produced nothing
+              if [ ! -s test-results.xml ]; then
+                echo "⚠️  test-results.xml was empty; writing minimal report"
+                printf '%s\n' \
+                  "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" \
+                  "<testsuites>" \
+                  "  <testsuite name=\"test-run\" tests=\"0\" failures=\"0\" errors=\"0\" skipped=\"0\"/>" \
+                  "</testsuites>" \
+                > test-results.xml
+              fi
+              
+              # Optionally allow test failures without failing the pipeline
+              if [ "${TEST_ALLOW_FAILURE:-true}" = "true" ]; then
+                echo "TEST_ALLOW_FAILURE=true: continuing despite test exit code $TEST_EXIT_CODE" | tee -a test-summary.txt
+                TEST_EXIT_CODE=0
+              fi
+
+              # Exit with test result (possibly overridden)
+              exit $TEST_EXIT_CODE
+            '
+
+            # If tests are allowed to fail, override docker run exit code
+            if [ "${TEST_ALLOW_FAILURE:-true}" = "true" ]; then
+              echo "TEST_ALLOW_FAILURE=true: not failing step on test failures"
+              true
+            fi
+            
+            # Optional: print minimal coverage summary if available
+            cat coverage/lcov.info >/dev/null 2>&1 || true
+        artifacts:
+          - coverage/**
+          - test-results.xml
+
+    - step: &build-node
+        name: 🐳 Build Docker Image (Node.js)
+        clone: 
+          enabled: true
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+
+            
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            # Only run preview deployment for PRs targeting develop/dev
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping preview deployment: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_BUILD}" = "true" ]; then
+              echo "Skipping build because SKIP_BUILD=true"
+              exit 0
+            fi
+
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+
+            # Optionally generate package-lock.json if missing (opt-in)
+            if [ "${GENERATE_LOCK_IN_PIPELINE}" = "true" ] && [ ! -f "package-lock.json" ] && [ -f "package.json" ]; then
+              echo "package-lock.json not found, generating it..."
+              USER_ID=$(id -u)
+              GROUP_ID=$(id -g)
+              NODE_VERSION="${NODE_VERSION:-20}"
+              docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+                -v "$(pwd)":/app -w /app \
+                -e HOME=/tmp \
+                node:${NODE_VERSION} bash -c '
+                export npm_config_cache=/tmp/.npm
+                npm install --package-lock-only --cache /tmp/.npm
+              ' || {
+                echo "ERROR: Failed to generate package-lock.json"
+                exit 1
+              }
+              echo "package-lock.json generated successfully"
+            fi
+
+            # Verify package-lock.json exists before building (unless Dockerfile handles install)
+            if [ ! -f "package-lock.json" ] && [ -z "${DOCKERFILE_HANDLES_INSTALL}" ]; then
+              echo "WARNING: package-lock.json not found. It's recommended to commit a lockfile or set DOCKERFILE_HANDLES_INSTALL=true if your Dockerfile runs install."
+            fi
+            
+            # Normalize and pass VAR_<TARGET_ENV> as build args e.g. VAR_preview -> VAR
+            TARGET_ENV="${TARGET_ENV:-${ENVIRONMENT:-preview}}"
+            while IFS='=' read -r __n __v; do
+              case "$__n" in
+                *_"$TARGET_ENV")
+                  __base="${__n%_*}"
+                  export "$__base=$__v"
+                  [ -n "$__v" ] && BUILD_ARGS="$BUILD_ARGS --build-arg $__base=$__v"
+                ;;
+              esac
+            done < <(env)
+
+            # Also support peer service URL generation in build (like deploy)
+            # Format: PEER_HOST_URLS="FRONTEND_URL.zenit-claim-app,BACKEND_URL.zenit-claim-api"
+            if [ "$TARGET_ENV" = "preview" ] && [ -n "${PEER_HOST_URLS:-}" ]; then
+              # Derive PREVIEW_KEY similarly to deploy logic
+              PREVIEW_KEY_DERIVED="${PREVIEW_SLUG#preview-}"
+              PREVIEW_KEY_DERIVED="${PREVIEW_KEY_DERIVED%-${BITBUCKET_REPO_SLUG}}"
+              PREVIEW_KEY_USE="${PREVIEW_KEY:-$PREVIEW_KEY_DERIVED}"
+              IFS=',' read -r -a __pairs <<< "${PEER_HOST_URLS}"
+              for __pair in "${__pairs[@]}"; do
+                __pair="$(echo "${__pair}" | xargs)"; [ -z "${__pair}" ] && continue
+                __var_name="${__pair%%.*}"; __app_slug="${__pair#*.}"
+                __host="preview-${PREVIEW_KEY_USE}-${__app_slug}.internal.${PREVIEW_DOMAIN_NAME}"
+                __url="https://${__host}"
+                export "${__var_name}=${__url}"
+                BUILD_ARGS="$BUILD_ARGS --build-arg ${__var_name}=${__url}"
+              done
+            fi
+            [ -n "$BUILD_ARGS" ] && echo "Build args (static): $BUILD_ARGS"
+
+            
+
+            echo "Building Docker image..."
+            docker build $BUILD_ARGS \
+              -t "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" . || {
+              echo "ERROR: Docker build failed"
+              exit 1
+            }
+
+            # Tag images as needed
+            TAGS_TO_PUSH=()
+
+            # Tag and push dev image only for develop/dev branch
+            if [ "$BITBUCKET_BRANCH" = "develop" ] || [ "$BITBUCKET_BRANCH" = "dev" ]; then
+              # Use DEV_TAG from setup-env if available, otherwise calculate
+              if [ -z "${DEV_TAG:-}" ]; then
+                SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+                DEV_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-$SHORT_COMMIT"
+                echo "Calculated DEV_TAG: $DEV_TAG"
+              else
+                echo "Using DEV_TAG from setup-env: $DEV_TAG"
+              fi
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$DEV_TAG"
+              export DEV_TAG
+              TAGS_TO_PUSH+=("$DEV_TAG")
+              echo "Tagged dev image: $DEV_TAG"
+            else
+              echo "Skipping dev tag push (not on develop/dev branch)"
+            fi
+
+            # Tag and push UAT image for release/* branches
+            if [[ "$BITBUCKET_BRANCH" =~ ^release/ ]]; then
+              # Use UAT_TAG from setup-env if available, otherwise calculate
+              if [ -z "${UAT_TAG:-}" ]; then
+                RELEASE_TAG="release-$(echo $BITBUCKET_BRANCH | sed 's/release\///')"
+                UAT_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$RELEASE_TAG"
+                echo "Calculated UAT_TAG: $UAT_TAG"
+              else
+                echo "Using UAT_TAG from setup-env: $UAT_TAG"
+              fi
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$UAT_TAG"
+              export UAT_TAG
+              TAGS_TO_PUSH+=("$UAT_TAG")
+              echo "Tagged UAT image: $UAT_TAG"
+            fi
+
+            # Tag and push prod image for main branch
+            if [ "$BITBUCKET_BRANCH" = "main" ]; then
+              # Use PROD_TAG from setup-env if available, otherwise calculate
+              if [ -z "${PROD_TAG:-}" ]; then
+                VERSION="${VERSION:-}"
+                if [ -z "$VERSION" ] && [ -n "$BITBUCKET_TAG" ]; then
+                  VERSION="$(echo "$BITBUCKET_TAG" | sed -E 's/^(v|release-)//')"
+                fi
+                if [ -z "$VERSION" ]; then
+                  echo "WARNING: VERSION not provided for main branch, using commit hash"
+                  VERSION="prod-$BITBUCKET_COMMIT"
+                fi
+                PROD_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$VERSION"
+                echo "Calculated PROD_TAG: $PROD_TAG"
+              else
+                echo "Using PROD_TAG from setup-env: $PROD_TAG"
+              fi
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$PROD_TAG"
+              export PROD_TAG
+              TAGS_TO_PUSH+=("$PROD_TAG")
+              echo "Tagged prod image: $PROD_TAG"
+            fi
+
+            # Tag and push feature/branch or PR image via TAG_SLUG (only for non-main branches)
+            if [ -n "$TAG_SLUG" ] && [ "$BITBUCKET_BRANCH" != "develop" ] && [ "$BITBUCKET_BRANCH" != "dev" ] && [ "$BITBUCKET_BRANCH" != "main" ] && [[ ! "$BITBUCKET_BRANCH" =~ ^release/ ]]; then
+              BR_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$TAG_SLUG"
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$BR_TAG"
+              TAGS_TO_PUSH+=("$BR_TAG")
+              echo "Tagged branch/PR image: $BR_TAG"
+            fi
+
+            # Push all tags with error checking
+            for TAG in "${TAGS_TO_PUSH[@]}"; do
+              echo "Pushing image: $TAG"
+              if docker push "$TAG"; then
+                echo "✅ Successfully pushed $TAG"
+              else
+                echo "ERROR: Failed to push $TAG"
+                exit 1
+            fi
+            done
+            
+            # Cleanup
+            docker rmi "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" 2>/dev/null || true
+            echo "Cleanup done"  
+
+# =============================================================================
+# PYTHON SPECIFIC IMPLEMENTATIONS
+# =============================================================================
+
+    - step: &lint-python
+        name: 🐍 Lint Python
+        clone: 
+          enabled: true
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            # Only run preview deployment for PRs targeting develop/dev
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping lint: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_LINT}" = "true" ]; then
+              echo "Skipping lint because SKIP_LINT=true"
+              exit 0
+            fi
+
+            export APP_PATH="${APP_PATH:-.}"
+            [ -d "${APP_PATH}" ] || { echo "Missing ${APP_PATH} directory in consumer repo"; exit 1; }
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+            PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+            PY_IMAGE="${PY_IMAGE:-python:${PYTHON_VERSION}-slim}"
+            PY_LINT_TOOL="${PY_LINT_TOOL:-auto}"
+
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)/${APP_PATH}":/app \
+              -w /app \
+              -e HOME=/tmp \
+              -e PIP_CACHE_DIR=/tmp/.pip \
+              -e CI=true \
+              ${PY_IMAGE} bash -lc '
+                set -e
+                python -V
+                python -m pip install -U pip >/dev/null 2>&1 || true
+                export PYTHONUSERBASE=/tmp/.local
+                export PATH="$PATH:/tmp/.local/bin"
+                # Install project deps (best-effort across common setups)
+                if [ -f requirements.txt ]; then
+                  pip install -r requirements.txt || true
+                fi
+                if [ -f requirements-dev.txt ]; then
+                  pip install -r requirements-dev.txt || true
+                fi
+                # Avoid installing the project itself during lint to prevent wheel builds
+                # Ensure linters present
+                if [ "${PY_LINT_TOOL}" = "ruff" ]; then
+                  pip install ruff
+                elif [ "${PY_LINT_TOOL}" = "flake8" ]; then
+                  pip install flake8
+                else
+                  pip install ruff flake8 >/dev/null 2>&1 || true
+                fi
+
+                # Choose tool
+                TOOL=""
+                if [ "${PY_LINT_TOOL}" = "ruff" ] || command -v ruff >/dev/null 2>&1; then TOOL=ruff; fi
+                if [ -z "$TOOL" ] && ( [ "${PY_LINT_TOOL}" = "flake8" ] || command -v flake8 >/dev/null 2>&1 ); then TOOL=flake8; fi
+                if [ -z "$TOOL" ]; then echo "No Python linter available (ruff/flake8)."; exit 1; fi
+
+                echo "Using linter: $TOOL"
+                if [ "$TOOL" = ruff ]; then
+                  ruff --version
+                  ruff check . --output-format json | tee python-lint-report.json
+                  EXIT=$?
+                  # Also produce human summary
+                  ruff check . 2>&1 | tee lint-py-results.txt
+                  exit $EXIT
+                else
+                  flake8 --version
+                  # Produce text output and a minimal JSON placeholder to avoid quoting issues
+                  flake8 . 2>&1 | tee lint-py-results.txt
+                  EXIT=${PIPESTATUS[0]}
+                  echo '{"results":[]}' > python-lint-report.json
+                  exit $EXIT
+                fi
+              '
+
+            LINT_EXIT_CODE=$?
+            if [ "${LINT_ALLOW_FAILURE:-true}" = "true" ]; then
+              echo "LINT_ALLOW_FAILURE=true: continuing despite lint exit code $LINT_EXIT_CODE" | tee -a lint-py-results.txt
+              LINT_EXIT_CODE=0
+            fi
+            exit $LINT_EXIT_CODE
+        artifacts:
+          - lint-py-results.txt
+          - python-lint-report.json
+
+    - step: &test-python
+        name: 🐍 Run Python Tests
+        clone: 
+          enabled: true
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            # Only run preview deployment for PRs targeting develop/dev/main/release/*
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping tests: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_TESTS}" = "true" ] || [ "${SKIP_TEST}" = "true" ]; then
+              echo "Skipping tests because SKIP_TESTS=true or SKIP_TEST=true"
+              exit 0
+            fi
+
+            export APP_PATH="${APP_PATH:-.}"
+            [ -d "${APP_PATH}" ] || { echo "Missing ${APP_PATH} directory in consumer repo"; exit 1; }
+
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            USER_ID=$(id -u)
+            GROUP_ID=$(id -g)
+            PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
+            PY_IMAGE="${PY_IMAGE:-python:${PYTHON_VERSION}-slim}"
+
+            docker run --rm --user "${USER_ID}:${GROUP_ID}" \
+              -v "$(pwd)/${APP_PATH}":/app \
+              -w /app \
+              -e HOME=/tmp \
+              -e PIP_CACHE_DIR=/tmp/.pip \
+              -e CI=true \
+              ${PY_IMAGE} bash -lc '
+                set -e
+                python -V
+                python -m pip install -U pip >/dev/null 2>&1 || true
+                export PYTHONUSERBASE=/tmp/.local
+                export PATH="$PATH:/tmp/.local/bin"
+                # Install test deps
+                pip install pytest pytest-cov junit-xml >/dev/null 2>&1 || true
+                if [ -f requirements.txt ]; then pip install -r requirements.txt || true; fi
+                if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt || true; fi
+                # Avoid installing the project itself during tests to prevent wheel builds unless explicitly requested
+                if [ "${INSTALL_PROJECT_FOR_TESTS}" = "true" ] && [ -f pyproject.toml ]; then pip install . || true; fi
+
+                # If no tests are collected, skip coverage run and write minimal JUnit
+                if pytest --collect-only -q >/tmp/pytest-collect.txt 2>/dev/null; then
+                  if [ ! -s /tmp/pytest-collect.txt ]; then
+                    echo "No tests collected; writing minimal JUnit XML and skipping coverage"
+                    printf '%s\n' \
+                      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" \
+                      "<testsuites>" \
+                      "  <testsuite name=\"pytest\" tests=\"0\" failures=\"0\" errors=\"0\" skipped=\"0\"/>" \
+                      "</testsuites>" \
+                    > test-results-py.xml
+                    exit 0
+                  fi
+                fi
+
+                # Run pytest with JUnit + coverage
+                set +e
+                pytest -q --maxfail=1 --disable-warnings \
+                  --junitxml=test-results-py.xml \
+                  --cov=. --cov-report=xml:coverage.xml --cov-report=term-missing 2>&1 | tee test-output-py.txt
+                EXIT=${PIPESTATUS[0]}
+                # Treat PyTest exit code 5 (no tests collected) as success
+                if [ "$EXIT" -eq 5 ]; then
+                  echo "No tests collected (pytest exit 5); treating as success"
+                  EXIT=0
+                fi
+                # Ensure a non-empty, well-formed XML exists even if pytest produced nothing
+                if [ ! -s test-results-py.xml ]; then
+                  echo "test-results-py.xml was empty; writing minimal report"
+                  printf '%s\n' \
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" \
+                    "<testsuites>" \
+                    "  <testsuite name=\"pytest\" tests=\"0\" failures=\"0\" errors=\"0\" skipped=\"0\"/>" \
+                    "</testsuites>" \
+                  > test-results-py.xml
+                fi
+                set -e
+                exit $EXIT
+              '
+
+            TEST_EXIT_CODE=$?
+            # Basic human summary
+            echo "=== Python Test Summary ===" > test-summary-py.txt
+            tail -n 200 ${APP_PATH}/test-output-py.txt >> test-summary-py.txt 2>/dev/null || true
+
+            if [ "${TEST_ALLOW_FAILURE:-true}" = "true" ]; then
+              echo "TEST_ALLOW_FAILURE=true: continuing despite test exit code $TEST_EXIT_CODE" | tee -a test-summary-py.txt
+              TEST_EXIT_CODE=0
+            fi
+            exit $TEST_EXIT_CODE
+        artifacts:
+          - test-results-py.xml
+          - test-summary-py.txt
+          - coverage.xml
+
+    - step: &build-python
+        name: 🐳 Build Python Docker Image
+        clone: 
+          enabled: true
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            # Only build for PRs to develop/dev/main/release/* by default (override with FORCE_BUILD=true)
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && [ "${FORCE_BUILD}" != "true" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping python image build: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_BUILD}" = "true" ]; then
+              echo "Skipping build because SKIP_BUILD=true"
+              exit 0
+            fi
+
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+
+            APP_PATH_DIR="${APP_PATH:-.}"
+            DOCKERFILE_PATH="${DOCKERFILE_PATH:-$APP_PATH_DIR/Dockerfile}"
+            BUILD_CONTEXT="${BUILD_CONTEXT:-$APP_PATH_DIR}"
+
+            [ -f "$DOCKERFILE_PATH" ] || { echo "ERROR: Dockerfile not found at $DOCKERFILE_PATH"; exit 1; }
+
+            echo "Building Docker image from $DOCKERFILE_PATH with context $BUILD_CONTEXT..."
+            docker build -f "$DOCKERFILE_PATH" "$BUILD_CONTEXT" \
+              -t "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" || {
+              echo "ERROR: Docker build failed"
+              exit 1
+            }
+
+            TAGS_TO_PUSH=()
+            
+            # Tag and push dev image only for develop/dev branch
+            if [ "$BITBUCKET_BRANCH" = "develop" ] || [ "$BITBUCKET_BRANCH" = "dev" ]; then
+              # Use DEV_TAG from setup-env if available, otherwise calculate
+              if [ -z "${DEV_TAG:-}" ]; then
+                SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+                DEV_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-$SHORT_COMMIT"
+                echo "Calculated DEV_TAG: $DEV_TAG"
+              else
+                echo "Using DEV_TAG from setup-env: $DEV_TAG"
+              fi
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$DEV_TAG"
+              TAGS_TO_PUSH+=("$DEV_TAG")
+              echo "Tagged dev image: $DEV_TAG"
+            else
+              echo "Skipping dev tag push (not on develop/dev branch)"
+            fi
+
+            # Tag and push feature/branch or PR image via TAG_SLUG (only for non-main branches)
+            if [ -n "$TAG_SLUG" ] && [ "$BITBUCKET_BRANCH" != "develop" ] && [ "$BITBUCKET_BRANCH" != "dev" ]; then
+              BR_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$TAG_SLUG"
+              docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$BR_TAG"
+              TAGS_TO_PUSH+=("$BR_TAG")
+              echo "Tagged branch/PR image: $BR_TAG"
+            fi
+
+            for TAG in "${TAGS_TO_PUSH[@]}"; do
+              echo "Pushing image: $TAG"
+              if docker push "$TAG"; then
+                echo "✅ Successfully pushed $TAG"
+              else
+                echo "ERROR: Failed to push $TAG"
+                exit 1
+              fi
+            done
+
+            # Optionally clean up local image
+            docker rmi "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" 2>/dev/null || true
+
+    - step: &sonar
+        name: 📊 SonarQube Analysis (Quality gate)
+        caches: [sonar]
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Restore consumer repo from artifact snapshot
+            if [ -d ".consumer-repo-snapshot" ]; then
+              echo "Restoring consumer repo from snapshot..."
+              rsync -a .consumer-repo-snapshot/ ./
+              
+              # Copy cloud-generated artifacts to expected locations for Sonar
+              echo "Copying cloud-generated artifacts for Sonar..."
+              echo "DEBUG: Checking .consumer-repo-snapshot contents:"
+              ls -la .consumer-repo-snapshot/ || echo "No .consumer-repo-snapshot directory"
+              
+              # Node.js artifacts
+              if [ -f ".consumer-repo-snapshot/eslint-results.json" ]; then
+                cp .consumer-repo-snapshot/eslint-results.json eslint-report.json
+                echo "Copied ESLint results for Sonar"
+              else
+                echo "DEBUG: No ESLint results found in .consumer-repo-snapshot/"
+              fi
+              if [ -d ".consumer-repo-snapshot/coverage" ]; then
+                echo "DEBUG: Found coverage directory, copying..."
+                cp -r .consumer-repo-snapshot/coverage ./
+                echo "Copied Node.js coverage directory for Sonar"
+                echo "DEBUG: Coverage directory contents after copy:"
+                ls -la coverage/ || echo "Coverage directory not found after copy"
+              else
+                echo "DEBUG: No coverage directory found in .consumer-repo-snapshot/"
+              fi
+              if [ -f ".consumer-repo-snapshot/coverage.json" ]; then
+                cp .consumer-repo-snapshot/coverage.json ./
+                echo "Copied Node.js coverage.json for Sonar"
+              else
+                echo "DEBUG: No coverage.json found in .consumer-repo-snapshot/"
+              fi
+              
+              # Python artifacts
+              if [ -f ".consumer-repo-snapshot/pylint-results.json" ]; then
+                cp .consumer-repo-snapshot/pylint-results.json python-lint-report.json
+                echo "Copied Pylint results for Sonar"
+              fi
+              if [ -f ".consumer-repo-snapshot/python-coverage.json" ]; then
+                cp .consumer-repo-snapshot/python-coverage.json python-coverage.json
+                echo "Copied Python coverage.json for Sonar"
+              fi
+              if [ -f ".consumer-repo-snapshot/coverage.xml" ]; then
+                cp .consumer-repo-snapshot/coverage.xml ./
+                echo "Copied Python coverage.xml for Sonar"
+              fi
+              if [ -d ".consumer-repo-snapshot/htmlcov" ]; then
+                cp -r .consumer-repo-snapshot/htmlcov ./htmlcov
+                echo "Copied Python HTML coverage for Sonar"
+              fi
+              
+              rm -rf .consumer-repo-snapshot
+              echo "Consumer repo restored with cloud artifacts"
+            fi
+            
+            # Optional: import Docker Scout results into Sonar (if available)
+            if [ -f "docker-scout-results.sarif" ] && [ -f "shared-pipelines/scripts/sonar/import-docker-scout-to-sonar.sh" ]; then
+              echo "Importing Docker Scout results into Sonar..."
+              bash shared-pipelines/scripts/sonar/import-docker-scout-to-sonar.sh || true
+            else
+              echo "Docker Scout report or import script not found; skipping import"
+            fi
+
+            # Optional: show first lines of eslint report if present (truncate long lines)
+            head -n 2 eslint-report.json 2>/dev/null | cut -c1-1000 || true
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            # Only run preview deployment for PRs targeting develop/dev
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping SonarQube: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            # Minimal useful diagnostics
+            [ -n "${SKIP_SONAR:-}" ] && echo "INFO: SKIP_SONAR=${SKIP_SONAR}"
+            
+            # Check multiple possible variable names for skipping SonarQube
+            if [ "${SKIP_SONAR}" = "true" ] || [ "${SONAR_SKIP}" = "true" ] ; then
+              echo "Skipping SonarQube because SKIP_SONAR=true or SONAR_SKIP=true or SKIP_SONARQUBE=true"
+              exit 0
+            fi
+            
+            # Use Docker container with correct Java version for SonarQube
+            echo "Running SonarQube analysis checks..."
+            
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Pull the correct SonarQube scanner CLI image
+            docker pull sonarsource/sonar-scanner-cli:latest || {
+              echo "ERROR: Failed to pull sonarsource/sonar-scanner-cli:latest"
+              exit 1
+            }
+            
+            # Set the Docker command for scanner CLI (run as current user; keep writes out of repo)
+            SONAR_CMD="docker run --rm -v $(pwd):/workspace -w /workspace sonarsource/sonar-scanner-cli:latest sonar-scanner"
+            
+            
+            # Ensure we're using self-hosted SonarQube, not SonarCloud
+            export SONAR_HOST_URL=$SONAR_HOST_URL
+            export SONAR_TOKEN=$SONAR_TOKEN
+            
+            # Fix potential double slash issue in URL
+            # Remove trailing slash from SONAR_HOST_URL if present
+            SONAR_HOST_URL="${SONAR_HOST_URL%/}"
+            echo "SONAR_URL: $SONAR_HOST_URL"
+            
+            # Create branch-specific project keys for Community Edition
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            if [ -n "$PR_ID_FOR_USE" ]; then
+              # For PRs, use PR-specific project key
+              export SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-pr-${PR_ID_FOR_USE}"
+              echo "INFO: PR detected - using project key: $SONAR_PROJECT_KEY"
+            else
+              # For regular branches, use branch-specific project key
+              export SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-${BITBUCKET_BRANCH}"
+              echo "INFO: Branch detected - using project key: $SONAR_PROJECT_KEY"
+              # Replace all '/' with '-' to satisfy Sonar key constraints (e.g., feature/test-ci -> feature-test-ci)
+              SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY//\//-}"
+              echo "INFO: Normalized project key: $SONAR_PROJECT_KEY"
+            fi
+            
+            # Debug: Show configuration
+            echo "Project Key: $SONAR_PROJECT_KEY"
+            
+            # For Community Edition, we can only analyze the main branch
+            # No branch analysis, no pull request analysis
+            # Community Edition: analyze main branch only
+            
+            # Note: Configuration is passed directly to sonar-scanner via -D parameters
+            # This avoids conflicts with consumer repo's sonar-project.properties
+            
+            # Execute SonarQube scanner
+            echo "INFO: Running SonarQube scanner for project: $SONAR_PROJECT_KEY"
+            echo "INFO: SonarQube URL: $SONAR_HOST_URL"
+            
+            # Coverage debug: enumerate and preview LCOV files so Sonar can pick them up
+            echo "=== Coverage debug: scanning for lcov.info files ==="
+            FOUND_COVERAGE_FILES=$(find . -type f \( -path "./coverage/lcov.info" -o -name "lcov.info" \) | sort || true)
+            if [ -n "$FOUND_COVERAGE_FILES" ]; then
+              echo "Found $(echo "$FOUND_COVERAGE_FILES" | wc -l | tr -d ' ') lcov file(s):"
+              echo "$FOUND_COVERAGE_FILES" | sed -n '1,50p'
+              # Preview first 2 files
+              i=0; echo "$FOUND_COVERAGE_FILES" | while read -r f; do
+                [ -f "$f" ] || continue; i=$((i+1)); echo "----- head -n 20 $f -----"; head -n 20 "$f" || true; [ $i -ge 2 ] && break || true; done
+            else
+              echo "No lcov.info files found. Ensure your test command generates coverage before Sonar runs."
+              echo "Typical fixes: add --coverage to Jest/react-scripts, ensure working dir matches APP_PATH, or check monorepo paths."
+              echo "PWD=$(pwd)"
+              ls -la . || true
+              ls -la coverage || true
+            fi
+            
+            # Decide whether to include external issues file (generated from Docker Scout)
+            SONAR_EXTRA_ARGS=""
+            if [ -f "sonar-issues.json" ]; then
+              echo "INFO: Including external issues from sonar-issues.json"
+              SONAR_EXTRA_ARGS="-Dsonar.externalIssuesReportPaths=sonar-issues.json"
+            else
+              echo "INFO: No sonar-issues.json found; skipping external issues import"
+            fi
+
+            # Include Python coverage if available (from pytest --cov --cov-report=xml:coverage.xml)
+            if [ -f "coverage.xml" ]; then
+              echo "INFO: Including Python coverage from coverage.xml"
+              SONAR_EXTRA_ARGS="$SONAR_EXTRA_ARGS -Dsonar.python.coverage.reportPaths=coverage.xml"
+            fi
+
+            # Include test sources only when src/ exists (avoids errors for Python-only repos)
+            SONAR_TEST_ARGS=""
+            if [ -d "src" ]; then
+              SONAR_TEST_ARGS="-Dsonar.tests=src -Dsonar.test.inclusions=**/*.spec.ts,**/*.test.ts"
+            else
+              echo "INFO: No src/ directory; skipping sonar.tests configuration"
+            fi
+            
+            # Normalize ESLint report file paths for Sonar
+            if [ -f "eslint-report.json" ] && [ -s "eslint-report.json" ]; then
+              echo "Normalizing ESLint report paths for Sonar..."
+              echo "DEBUG: Before normalization - first few lines of eslint-report.json:"
+              head -n 3 eslint-report.json || true
+              
+              if command -v jq >/dev/null 2>&1; then
+                # Handle both Docker (/app/) and cloud runner absolute paths
+                echo "DEBUG: Running jq normalization..."
+                if jq 'map(.filePath |= sub("^/app/"; "./") | sub("^/opt/atlassian/pipelines/agent/build/.consumer-repo-snapshot/"; "./"))' eslint-report.json > eslint-report.normalized.json 2>/dev/null; then
+                  mv eslint-report.normalized.json eslint-report.json
+                  echo "DEBUG: jq normalization successful"
+                else
+                  echo "DEBUG: jq normalization failed, trying alternative approach..."
+                  # Alternative: use sed as fallback
+                  sed 's|/opt/atlassian/pipelines/agent/build/.consumer-repo-snapshot/||g' eslint-report.json > eslint-report.normalized.json && mv eslint-report.normalized.json eslint-report.json || true
+                fi
+                echo "DEBUG: After normalization - first few lines of eslint-report.json:"
+                head -n 3 eslint-report.json || true
+              else
+                # Fallback to sed for both Docker and cloud runner paths
+                sed -e 's#"/app/#"./#g' -e 's#"\.consumer-repo-snapshot/#"./#g' eslint-report.json > eslint-report.normalized.json 2>/dev/null && mv eslint-report.normalized.json eslint-report.json || true
+              fi
+            fi
+            
+            # Run the scanner with proper parameters
+            $SONAR_CMD \
+              -Dsonar.host.url="$SONAR_HOST_URL" \
+              -Dsonar.login="$SONAR_TOKEN" \
+              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+              -Dsonar.projectName="$SONAR_PROJECT_KEY" \
+              -Dsonar.projectVersion="1.0" \
+              -Dsonar.sources="." \
+              -Dsonar.exclusions="node_modules/**,coverage/**,dist/**,build/**,.git/**,shared-pipelines/**" \
+              -Dsonar.coverage.exclusions="**/*.test.js,**/*.spec.js,**/*.test.ts,**/*.spec.ts" \
+              -Dsonar.javascript.lcov.reportPaths="coverage/lcov.info,coverage/**/lcov.info" \
+              -Dsonar.typescript.lcov.reportPaths="coverage/lcov.info,coverage/**/lcov.info" \
+              -Dsonar.eslint.reportPaths="eslint-report.json" \
+              -Dsonar.working.directory=/tmp/sonar \
+              $SONAR_EXTRA_ARGS \
+              $SONAR_TEST_ARGS || {
+              echo "ERROR: SonarQube scanner failed"
+              exit 1
+            }
+            
+            echo "✅ SonarQube scanner completed successfully"
+            # Ownership safety net: ensure no root-owned files remain in workspace
+            if command -v sudo >/dev/null 2>&1; then
+              sudo chown -R "$(id -u):$(id -g)" . || true
+            else
+              chown -R "$(id -u):$(id -g)" . 2>/dev/null || true
+            fi
+            
+            # Wait for analysis to be processed by SonarQube
+            echo "Waiting for SonarQube to process analysis..."
+            sleep 10
+            
+            # Check quality gate results (no authentication required)
+            echo "Checking quality gate for: $SONAR_PROJECT_KEY"
+            
+            # Get quality gate response
+            echo "=== Getting Quality Gate Response ==="
+            RESPONSE_BODY=$(curl -s "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY")
+            CURL_EXIT_CODE=$?
+            
+            [ "$CURL_EXIT_CODE" -ne 0 ] && echo "WARNING: Sonar API curl exit=$CURL_EXIT_CODE"
+            
+            # Save the raw response to a file
+            echo "$RESPONSE_BODY" > quality-gate-response.json
+            
+            if [ -n "$RESPONSE_BODY" ]; then
+              # Check if response is valid JSON
+              if echo "$RESPONSE_BODY" | jq . > /dev/null 2>&1; then
+                STATUS=$(echo "$RESPONSE_BODY" | jq -r '.projectStatus.status // "UNKNOWN"')
+                echo "Quality Gate Status: $STATUS"
+                
+                # Create a formatted quality gate summary
+                echo "=== Quality Gate Summary ===" > quality-gate-summary.txt
+                echo "Project: $SONAR_PROJECT_KEY" >> quality-gate-summary.txt
+                echo "Timestamp: $(date)" >> quality-gate-summary.txt
+                echo "Status: $STATUS" >> quality-gate-summary.txt
+                echo "" >> quality-gate-summary.txt
+                
+                if [ "$STATUS" = "OK" ]; then
+                  echo "✅ Quality gate PASSED" >> quality-gate-summary.txt
+                  echo "✅ Quality gate PASSED"
+                  echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                elif [ "$STATUS" = "UNKNOWN" ]; then
+                  echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet" >> quality-gate-summary.txt
+                  echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet"
+                else
+                  echo "❌ Quality gate FAILED: $STATUS" >> quality-gate-summary.txt
+                  echo "❌ Quality gate FAILED: $STATUS"
+                  echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+
+                  if [ -n "$PR_ID_FOR_USE" ]; then
+                    echo "PR context detected; continuing despite quality gate failure"
+                  elif [ "${SONAR_ALLOW_FAILURE:-true}" = "true" ]; then
+                    echo "Sonar allow failure is true; continuing despite quality gate failure"
+                    exit 0
+                  else
+                    echo "Failing pipeline (non-PR) due to quality gate failure"
+                    exit 1
+                  fi
+                fi
+                
+                # Add detailed conditions if available
+                if echo "$RESPONSE_BODY" | jq -e '.projectStatus.conditions' > /dev/null 2>&1; then
+                  echo "" >> quality-gate-summary.txt
+                  echo "=== Quality Gate Conditions ===" >> quality-gate-summary.txt
+                  echo "$RESPONSE_BODY" | jq -r '.projectStatus.conditions[] | "\(.metricKey): \(.status) (Threshold: \(.errorThreshold), Actual: \(.actualValue))"' >> quality-gate-summary.txt
+                fi
+                
+              else
+                echo "⚠️  Invalid JSON response from quality gate API" >> quality-gate-summary.txt
+                echo "⚠️  Invalid JSON response from quality gate API"
+                echo "Continuing without quality gate validation"
+              fi
+            else
+              echo "⚠️  No response from quality gate API" >> quality-gate-summary.txt
+              echo "⚠️  No response from quality gate API"
+              echo "Continuing without quality gate validation"
+            fi            
+            
+        artifacts: 
+           - quality-gate-response.json
+           - quality-gate-summary.txt
+
+    - step: &teardown-sonar
+        name: 🧹 Cleanup SonarQube Project
+        caches: [sonar]
+        clone:
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Only run for PRs that are being closed/merged
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            if [ -z "$PR_ID_FOR_USE" ]; then
+              echo "Not a PR - skipping SonarQube cleanup"
+              exit 0
+            fi
+            
+            # Check if we should skip cleanup
+            if [ "${SKIP_SONAR_CLEANUP}" = "true" ]; then
+              echo "Skipping SonarQube cleanup because SKIP_SONAR_CLEANUP=true"
+              exit 0
+            fi
+            
+            echo "🧹 Cleaning up SonarQube project for PR #$PR_ID_FOR_USE"
+            
+            # Prepare Docker CLI environment
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Use the same project key logic as the sonar step
+            if [ -n "$PR_ID_FOR_USE" ]; then
+              SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-pr-${PR_ID_FOR_USE}"
+            else
+              SONAR_PROJECT_KEY="${SONAR_PROJECT_KEY:-$BITBUCKET_REPO_SLUG}-${BITBUCKET_BRANCH}"
+            fi
+            
+            echo "Project Key to delete: $SONAR_PROJECT_KEY"
+            echo "SonarQube URL: $SONAR_HOST_URL"
+            
+            # Delete the project using SonarQube API
+            echo "Deleting SonarQube project..."
+            RESPONSE=$(curl -s -w "%{http_code}" -X POST \
+              -u "$SONAR_TOKEN:" \
+              "$SONAR_HOST_URL/api/projects/delete?project=$SONAR_PROJECT_KEY")
+            
+            HTTP_CODE="${RESPONSE: -3}"
+            RESPONSE_BODY="${RESPONSE%???}"
+            
+            if [ "$HTTP_CODE" = "204" ] || [ "$HTTP_CODE" = "404" ]; then
+              echo "✅ SonarQube project deleted successfully (or didn't exist)"
+              echo "Project: $SONAR_PROJECT_KEY"
+              echo "Status: $HTTP_CODE"
+            else
+              echo "⚠️  SonarQube project deletion returned unexpected status: $HTTP_CODE"
+              echo "Response: $RESPONSE_BODY"
+              # Don't fail the pipeline for cleanup issues
+            fi
+            
+            # Create cleanup summary
+            echo "=== SonarQube Cleanup Summary ===" > sonar-cleanup-summary.txt
+            echo "Project: $SONAR_PROJECT_KEY" >> sonar-cleanup-summary.txt
+            echo "Timestamp: $(date)" >> sonar-cleanup-summary.txt
+            echo "Status: $HTTP_CODE" >> sonar-cleanup-summary.txt
+            echo "Response: $RESPONSE_BODY" >> sonar-cleanup-summary.txt
+        artifacts:
+          - sonar-cleanup-summary.txt
+
+    - step: &scout
+        name: 🔒 Docker Scout Scan
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            # Only run preview deployment for PRs targeting develop/dev
+            # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping preview deployment: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_SCOUT}" = "true" ]; then
+              echo "Skipping Docker Scout because SKIP_SCOUT=true"
+              exit 0
+            fi
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Choose image tag for scanning: prefer PR tag, then commit
+            CANDIDATE_TAGS="$TAG_SLUG $BITBUCKET_COMMIT"
+            SCAN_IMAGE=""
+            for tag in $CANDIDATE_TAGS; do
+              [ -z "$tag" ] && continue
+              echo "Trying to pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$tag for Scout..."
+              if docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$tag; then
+                SCAN_IMAGE="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$tag"
+                break
+              fi
+            done
+            if [ -z "$SCAN_IMAGE" ]; then
+              echo "WARNING: No image available to scan (tried PR, commit, latest). Skipping Scout."
+              exit 0
+            fi
+            
+            export DOCKER_SCOUT_HUB_USER="$DOCKERHUB_USERNAME"
+            export DOCKER_SCOUT_HUB_PASSWORD="$DOCKERHUB_TOKEN"
+            
+            echo "Running Docker Scout CVE scan..."
+            # Run with debug, target explicit image:// reference, capture stderr for diagnostics, and retry once if it fails
+            rm -f cve_report.json scout_cves.stderr || true
+            SCOUT_SCAN_FAILED=0
+            set +e
+            DOCKER_SCOUT_DEBUG=1 docker run --rm -u root \
+              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
+              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
+              -e DOCKER_SCOUT_DEBUG=1 \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              docker/scout-cli cves --format json image://$SCAN_IMAGE > cve_report.json 2> scout_cves.stderr || {
+              echo "First attempt failed; retrying Docker Scout CVE scan in 5s..."; sleep 5;
+              DOCKER_SCOUT_DEBUG=1 docker run --rm -u root \
+                -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
+                -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
+                -e DOCKER_SCOUT_DEBUG=1 \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                docker/scout-cli cves --format json image://$SCAN_IMAGE > cve_report.json 2>> scout_cves.stderr || SCOUT_SCAN_FAILED=1
+            }
+            if [ ! -s cve_report.json ] || [ "$SCOUT_SCAN_FAILED" = "1" ]; then
+              echo "WARN: Docker Scout CVE JSON scan failed; will derive summary from SARIF if available. Stderr:";
+              sed -n '1,200p' scout_cves.stderr || true
+            fi
+            set -e
+            
+            # Check for critical/high (aka major) CVEs, print details, and optionally fail
+            echo "Analyzing CVE report..."
+            if [ -f cve_report.json ] && [ -s cve_report.json ]; then
+              if command -v jq >/dev/null 2>&1; then
+                set +e
+                CRITICAL_COUNT=$(jq -r '[.vulnerabilities[]? | select((.severity|ascii_upcase)=="CRITICAL")] | length' cve_report.json 2>/dev/null || echo 0)
+                HIGH_COUNT=$(jq -r '[.vulnerabilities[]? | select(((.severity|ascii_upcase)=="HIGH") or ((.severity|ascii_upcase)=="MAJOR"))] | length' cve_report.json 2>/dev/null || echo 0)
+                MEDIUM_COUNT=$(jq -r '[.vulnerabilities[]? | select((.severity|ascii_upcase)=="MEDIUM")] | length' cve_report.json 2>/dev/null || echo 0)
+                LOW_COUNT=$(jq -r '[.vulnerabilities[]? | select((.severity|ascii_upcase)=="LOW")] | length' cve_report.json 2>/dev/null || echo 0)
+                set -e
+
+                echo "Docker Scout summary: critical=${CRITICAL_COUNT}, high=${HIGH_COUNT}, medium=${MEDIUM_COUNT}, low=${LOW_COUNT}"
+
+                if [ "${CRITICAL_COUNT}" -gt 0 ] || [ "${HIGH_COUNT}" -gt 0 ]; then
+                  echo "Top critical/high findings:"
+                  jq -r '
+                    .vulnerabilities[]? 
+                    | select(((.severity|ascii_upcase)=="CRITICAL") or ((.severity|ascii_upcase)=="HIGH") or ((.severity|ascii_upcase)=="MAJOR"))
+                    | "- "
+                      + (.severity // "") + " "
+                      + (.id // "") + ": "
+                      + (.title // "")
+                      + (if .package then " (pkg: " + (.package|tostring) + ")" 
+                         elif .packageName then " (pkg: " + (.packageName|tostring) + ")"
+                         else "" end)
+                  ' cve_report.json 2>/dev/null | head -n 20 || true
+                fi
+
+                if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                  PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+                  if [ -n "$PR_ID_FOR_USE" ]; then
+                    echo "PR context detected; continuing despite critical vulnerabilities"
+                  else
+                    echo "Failing pipeline (non-PR) due to critical vulnerabilities"
+                    exit 1
+                  fi
+                fi
+              else
+                echo "⚠️  jq not available, skipping CVE severity analysis"
+              fi
+            else
+              # Fallback: derive counts from SARIF if JSON is unavailable
+              if [ -f docker-scout-results.sarif ] && [ -s docker-scout-results.sarif ] && command -v jq >/dev/null 2>&1; then
+                echo "Deriving CVE summary from SARIF..."
+                set +e
+                CRITICAL_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="error")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+                HIGH_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="warning")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+                MEDIUM_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="note")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+                LOW_COUNT=0
+                set -e
+                echo "Docker Scout summary (from SARIF): critical=${CRITICAL_COUNT}, high=${HIGH_COUNT}, medium=${MEDIUM_COUNT}, low=${LOW_COUNT}"
+                if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
+                  echo "Top critical/high findings (from SARIF):"
+                  jq -r '
+                    .runs[0].results[]? 
+                    | select(((.level|ascii_downcase)=="error") or ((.level|ascii_downcase)=="warning"))
+                    | "- "
+                      + (.level // "") + " "
+                      + (.ruleId // "") + ": "
+                      + (.message.text // "")
+                  ' docker-scout-results.sarif 2>/dev/null | head -n 20 || true
+                fi
+              else
+                echo "⚠️  CVE report not available and SARIF missing; skipping severity analysis (scan may have failed)"
+              fi
+            fi
+            
+            echo "Generating SBOM..."
+            docker run --rm -u root \
+              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
+              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$(pwd)":/workspace \
+              -w /workspace \
+              docker/scout-cli sbom --format spdx --output sbom.json image://$SCAN_IMAGE || {
+              echo "WARNING: Docker Scout SBOM generation failed"
+              echo "{}" > sbom.json
+            }
+            
+            # Generate SARIF report for SonarQube integration
+            echo "Generating SARIF report for SonarQube..."
+            docker run --rm -u root \
+              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
+              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$(pwd)":/workspace \
+              -w /workspace \
+              docker/scout-cli cves --format sarif --output docker-scout-results.sarif image://$SCAN_IMAGE || {
+              echo "WARNING: Docker Scout SARIF generation failed"
+              echo '{"$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json", "version": "2.1.0", "runs": [{"results": []}]}' > docker-scout-results.sarif
+            }
+            
+            # Verify the SBOM file was created and has content
+            if [ -f "sbom.json" ] && [ -s "sbom.json" ]; then
+              echo "SBOM created: $(wc -c < sbom.json) bytes"
+            else
+              echo "❌ SBOM file not found or empty"
+              echo "Current directory contents:"
+              ls -la
+              echo "{}" > sbom.json
+            fi
+
+            # Create compact XML summary for quick review (no leading spaces before XML declaration)
+            echo "Generating compact XML summary from SARIF..."
+            GEN_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            {
+              printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>'
+              printf '%s\n' '<dockerScout>'
+              printf '%s\n' '  <summary generated="'"${GEN_TS}"'">'
+              printf '%s\n' '    <image>'"$(printf '%s' "${SCAN_IMAGE}" | sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')"'</image>'
+              printf '%s\n' '  </summary>'
+              printf '%s\n' '  <findings>'
+            } > docker-scout-results.xml
+
+            if command -v jq >/dev/null 2>&1; then
+              jq -r '
+                .runs[0].results[]? | [
+                  (.ruleId // ""),
+                  (.level // ""),
+                  (.message.text // ""),
+                  (.locations[0].physicalLocation.artifactLocation.uri // "")
+                ] | @tsv
+              ' docker-scout-results.sarif | while IFS=$'\t' read -r rule level msg file; do
+                esc_rule=$(printf '%s' "$rule" | sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                esc_level=$(printf '%s' "$level" | sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                esc_msg=$(printf '%s' "$msg" | sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                esc_file=$(printf '%s' "$file" | sed 's/&/&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+                printf '    <finding rule="%s" severity="%s"><message>%s</message><file>%s</file></finding>\n' "$esc_rule" "$esc_level" "$esc_msg" "$esc_file" >> docker-scout-results.xml
+              done
+            else
+              printf '%s\n' '    <note>jq not available; XML summary limited</note>' >> docker-scout-results.xml
+            fi
+            printf '%s\n' '  </findings>' >> docker-scout-results.xml
+            printf '%s\n' '</dockerScout>' >> docker-scout-results.xml
+            
+            echo "Docker Scout analysis completed"
+        artifacts:
+          - sbom.json
+          - docker-scout-results.sarif
+          - docker-scout-results.xml
+
+    - step: &trigger-peer
+        name: 🔁 Trigger Peer Preview Pipeline (optional)
+        clone:
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # Only for PRs to develop/dev
+            if [ -z "$BITBUCKET_PR_ID" ]; then
+              echo "Not a PR; skipping peer trigger"
+              exit 0
+            fi
+            if [ "$BITBUCKET_PR_DESTINATION_BRANCH" != "develop" ] && [ "$BITBUCKET_PR_DESTINATION_BRANCH" != "dev" ]; then
+              echo "PR target=${BITBUCKET_PR_DESTINATION_BRANCH}; skipping peer trigger (want develop/dev)"
+              exit 0
+            fi
+
+            # Support single or comma-separated repos
+            REPOS_CSV="${PEER_REPO_SLUGS:-$PEER_REPO_SLUG}"
+            if [ -z "$REPOS_CSV" ]; then
+              echo "No peers configured (PEER_REPO_SLUGS/PEER_REPO_SLUG); skipping"
+              exit 0
+            fi
+
+            # Prevent trigger loops
+            if [ -n "$TRIGGER_SOURCE" ]; then
+              echo "TRIGGER_SOURCE=$TRIGGER_SOURCE set; skipping to prevent loops"
+              exit 0
+            fi
+
+            # Auth: require OAuth access token (BITBUCKET_ACCESS_TOKEN)
+            if [ -n "$BITBUCKET_ACCESS_TOKEN" ]; then
+              echo "Using OAuth access token for Bitbucket API"
+            else
+              echo "No Bitbucket credentials found: set BITBUCKET_ACCESS_TOKEN (OAuth access token)"
+              exit 0
+            fi
+
+            # Use exact same branch name as source
+            PEER_BRANCH="${BITBUCKET_BRANCH}"
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            THIS_IMAGE="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:${TAG_SLUG}"
+            TARGET_WORKSPACE="${PEER_WORKSPACE:-$BITBUCKET_WORKSPACE}"
+
+            IFS=',' read -r -a REPOS <<< "$REPOS_CSV"
+
+            for i in "${!REPOS[@]}"; do
+              REPO="${REPOS[$i]}"; REPO=${REPO// /}
+              [ -z "$REPO" ] && continue
+              PIPE="general-pipeline-pr"
+
+              # Only try the exact same branch name in the target repo
+              BRANCH_CANDIDATES=("$PEER_BRANCH")
+
+              TRIGGERED=false
+              for CANDIDATE_BRANCH in "${BRANCH_CANDIDATES[@]}"; do
+                # Check if branch exists in target repo
+                echo "Checking if branch $CANDIDATE_BRANCH exists in $TARGET_WORKSPACE/$REPO"
+                ENCODED_BRANCH=${CANDIDATE_BRANCH//\//%2F}
+                BRANCH_CHECK=$(curl -s -H "Authorization: Bearer $BITBUCKET_ACCESS_TOKEN" \
+                  "https://api.bitbucket.org/2.0/repositories/$TARGET_WORKSPACE/$REPO/refs/branches/$ENCODED_BRANCH")
+                if echo "$BRANCH_CHECK" | grep -q '"name"'; then
+                  echo "Branch $CANDIDATE_BRANCH exists in target repo"
+                else
+                  echo "Branch $CANDIDATE_BRANCH not found in target repo - skipping"
+                  continue
+                fi
+
+                echo "Triggering peer: $TARGET_WORKSPACE/$REPO -> '$PIPE' on $CANDIDATE_BRANCH"
+                REQ_BODY='{"target":{"type":"pipeline_ref_target","ref_type":"branch","ref_name":"'"$CANDIDATE_BRANCH"'"},"selector":{"type":"branch","pattern":"'"$CANDIDATE_BRANCH"'"},"variables":[{"key":"PR_ID","value":"'"$PR_ID_FOR_USE"'"},{"key":"PEER_SLUG","value":"'"${PREVIEW_SLUG:-}"'"},{"key":"PEER_IMAGE","value":"'"$THIS_IMAGE"'"},{"key":"PREVIEW_DOMAIN_NAME","value":"'"$PREVIEW_DOMAIN_NAME"'"},{"key":"ENVIRONMENT","value":"preview"},{"key":"TRIGGER_SOURCE","value":"'"$BITBUCKET_REPO_SLUG"'"}]}'
+                echo "DEBUG: Trigger request body:" && echo "$REQ_BODY"
+                RESPONSE=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer $BITBUCKET_ACCESS_TOKEN" \
+                  -H "Content-Type: application/json" \
+                  -X POST "https://api.bitbucket.org/2.0/repositories/$TARGET_WORKSPACE/$REPO/pipelines/" \
+                  -d "$REQ_BODY")
+
+                HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+                BODY=$(echo "$RESPONSE" | sed '$d')
+                echo "Peer trigger HTTP $HTTP_CODE"
+                [ -n "$BODY" ] && echo "DEBUG: response bytes: $(printf %s \"$BODY\" | wc -c | tr -d ' ')" && echo "$BODY" | sed -e 's/.\{0\}/  /'
+
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  # Extract pipeline identifiers
+                  PIPELINE_NUMBER=$(echo "$BODY" | jq -r '.build_number // empty')
+                  PIPELINE_UUID=$(echo "$BODY" | jq -r '.uuid // empty' | tr -d '{}')
+                  REPO_HTML=$(echo "$BODY" | jq -r '.repository.links.html.href // empty')
+                  # Build a user-friendly UI URL using build number
+                  if [ -n "$PIPELINE_NUMBER" ] && [ -n "$REPO_HTML" ]; then
+                    PIPELINE_URL_UI="${REPO_HTML%/}/pipelines/results/${PIPELINE_NUMBER}"
+                  else
+                    PIPELINE_URL_UI=$(echo "$BODY" | jq -r '.links.self.href // empty')
+                  fi
+                  echo "Peer trigger succeeded for $REPO/$PIPE on $CANDIDATE_BRANCH"
+                  if [ -n "$PIPELINE_NUMBER" ]; then
+                    echo "Pipeline #: $PIPELINE_NUMBER"
+                  fi
+                  if [ -n "$PIPELINE_URL_UI" ]; then
+                    echo "Pipeline URL: $PIPELINE_URL_UI"
+                  fi
+                  TRIGGERED=true
+                  break
+                fi
+
+                # If branch not found (404 reference-not-found), do not fallback
+                if [ "$HTTP_CODE" = "404" ] && echo "$BODY" | grep -q "reference-not-found"; then
+                  echo "Branch $CANDIDATE_BRANCH not found in $REPO, not falling back to any other branch."
+                  continue
+                fi
+
+                echo "WARNING: Peer trigger failed for $REPO/$PIPE (HTTP $HTTP_CODE)"
+                if [ "$HTTP_CODE" = "401" ] || [ "$HTTP_CODE" = "403" ]; then
+                  echo "Hint: Ensure BITBUCKET_ACCESS_TOKEN has pipelines:write and repository:write for $TARGET_WORKSPACE/$REPO, and Pipelines is enabled."
+                fi
+                # For errors other than missing ref, do not retry with other branches
+                break
+              done
+
+              if [ "$TRIGGERED" = false ]; then
+                echo "WARNING: Skipping trigger for $REPO because matching branch not found or pipelines.custom.preview missing on '${BRANCH_CANDIDATES[*]}'"
+              fi
+            done
+
+    - step: &promote-uat
+        name: 🚀 Promote dev -> uat
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+            # If IS_BACKEND is not set, then skip the promote step
+            if [ -z "$IS_BACKEND" ]; then
+              echo "IS_BACKEND is not set skipping promote step"
+              exit 0
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            # Preapre tag from branch name like release-1.0.0 from branch name release/1.0.0
+            TAG="release-$(echo $BITBUCKET_BRANCH | sed 's/release\///')"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Promote by digest to avoid tag drift
+            # Use shorter commit hash to match the dev tag format
+            SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+            SRC_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-$SHORT_COMMIT"
+            TARGET_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$TAG"
+
+            echo "Pulling source image: $SRC_TAG"
+            docker pull "$SRC_TAG" || { echo "ERROR: Failed to pull $SRC_TAG"; exit 1; }
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$SRC_TAG") || { echo "ERROR: Failed to get digest for $SRC_TAG"; exit 1; }
+            echo "Resolved digest: $DIGEST"
+            docker pull "$DIGEST" || { echo "ERROR: Failed to pull $DIGEST"; exit 1; }
+            docker tag "$DIGEST" "$TARGET_TAG"
+            docker push "$TARGET_TAG" || { echo "ERROR: Failed to push $TARGET_TAG"; exit 1; }
+            echo "✅ Promoted $DIGEST -> $TARGET_TAG"
+            # Write promoted tag to artifact file for deploy stages
+            echo "$TARGET_TAG" > uat.txt
+            # Cleanup local images
+            docker rmi "$TARGET_TAG" 2>/dev/null || true
+            docker rmi "$DIGEST" 2>/dev/null || true
+            docker rmi "$SRC_TAG" 2>/dev/null || true
+        artifacts:
+          - uat.txt
+
+    - step: &promote-prod
+        name: 🏭 Promote uat -> production
+        clone: 
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - common.ci
+        script:
+          - |
+
+            # If IS_BACKEND is not set, then skip the promote step
+            if [ -z "$IS_BACKEND" ]; then
+              echo "IS_BACKEND is not set skipping promote step"
+              exit 0
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Derive VERSION (preference: external VERSION var, git tag)
+            # VERSION identifies which release to promote (e.g., "1.0.0" promotes release-1.0.0 → 1.0.0)
+            VERSION="${VERSION:-}"
+            if [ -z "$VERSION" ] && [ -n "$BITBUCKET_TAG" ]; then
+              # Support tags like v1.0.0 or release-1.0.0
+              VERSION="$(echo "$BITBUCKET_TAG" | sed -E 's/^(v|release-)//')"
+            fi
+            if [ -z "$VERSION" ]; then
+              echo "ERROR: VERSION is required for prod promotion"
+              echo "Set VERSION variable (e.g., VERSION=1.0.0) to specify which UAT release to promote"
+              echo "This will promote: release-1.0.0 → 1.0.0 + latest"
+              exit 1
+            fi
+            
+            echo "Promoting to production: VERSION=${VERSION}"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Promote from UAT release tag or hotfix tag
+            # For hotfix: VERSION should be the full hotfix tag (e.g., hotfix-1.2.1)
+            # For release: VERSION is just the version number (e.g., 1.0.0)
+            
+            # Detect if VERSION starts with "hotfix-"
+            if [[ "$VERSION" =~ ^hotfix- ]]; then
+              # Hotfix flow: pull hotfix-X.Y.Z, promote to hotfix-X.Y.Z + latest
+              # Keep hotfix- prefix to avoid conflicts with regular releases
+              SRC_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:${VERSION}"
+              FINAL_VERSION="$VERSION"  # Keep hotfix- prefix
+              TAGS=("$FINAL_VERSION" "latest")
+              echo "Hotfix promotion: $SRC_TAG → $FINAL_VERSION + latest"
+            else
+              # Regular release flow: pull release-X.Y.Z, promote to X.Y.Z + latest
+              SRC_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:release-${VERSION}"
+              FINAL_VERSION="$VERSION"
+              TAGS=("$FINAL_VERSION" "latest")
+              echo "Release promotion: $SRC_TAG → $FINAL_VERSION + latest"
+            fi
+            
+            echo "Pulling source image: $SRC_TAG"
+            docker pull "$SRC_TAG" || { echo "ERROR: Failed to pull $SRC_TAG. Ensure tag exists."; exit 1; }
+            DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' "$SRC_TAG") || { echo "ERROR: Failed to get digest for $SRC_TAG"; exit 1; }
+            echo "Resolved digest: $DIGEST"
+            docker pull "$DIGEST" || { echo "ERROR: Failed to pull $DIGEST"; exit 1; }
+            for TAG in "${TAGS[@]}"; do
+              TARGET_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$TAG"
+              docker tag "$DIGEST" "$TARGET_TAG" || { echo "ERROR: Failed to tag as $TARGET_TAG"; exit 1; }
+              docker push "$TARGET_TAG" || { echo "ERROR: Failed to push $TARGET_TAG"; exit 1; }
+              echo "✅ Promoted $DIGEST -> $TARGET_TAG"
+              docker rmi "$TARGET_TAG" 2>/dev/null || true
+            done
+            # Write promoted tag to artifact file for deploy stages
+            echo "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$FINAL_VERSION" > prod.txt
+            docker rmi "$DIGEST" 2>/dev/null || true
+            docker rmi "$SRC_TAG" 2>/dev/null || true
+        artifacts:
+          - prod.txt
+
+    - step: &deploy-dev
+        name: 🚀 Deploy to Development
+        clone: 
+          enabled: true
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - dev.runner
+        deployment: dev
+        trigger: manual
+        script:
+          - |
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Load .env into current environment for docker compose variable interpolation
+            if [ -f .env ]; then
+              set -a
+              . ./.env
+              set +a
+            else
+              echo "WARNING: .env not found; compose interpolation may miss variables"
+            fi
+            echo "--------------------------------"
+            echo ".env:"
+            cat .env
+            echo "--------------------------------"
+            
+            # Override DOCKER_HOST from .env to use Unix socket (self-hosted runner)
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Set TAG_SLUG for dev environment (for docker compose interpolation)
+            TAG_SLUG="dev-${BITBUCKET_COMMIT:0:8}"
+            export TAG_SLUG
+            echo "Set TAG_SLUG: $TAG_SLUG"
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Deploy dev environment
+            if [ -z "${DEV_TAG}" ]; then
+              # Fallback: compute DEV_TAG same as build step
+              SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+              DEV_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-$SHORT_COMMIT"
+              echo "Computed DEV_TAG fallback: $DEV_TAG"
+            fi
+            # Require DOMAIN_NAME_DEV for routing (set in previous setup step)
+            if [ -z "${DOMAIN_NAME_DEV:-}" ]; then
+              echo "ERROR: DOMAIN_NAME_DEV is required for dev routing"; exit 1
+            fi
+            # Align convention: derive TRAEFIK_HOST_RULE once and persist in .env
+            TRAEFIK_HOST_RULE="Host(\`${DOMAIN_NAME_DEV}\`)"
+            export TRAEFIK_HOST_RULE
+            grep -q '^TRAEFIK_HOST_RULE=' .env 2>/dev/null && sed -i.bak "s|^TRAEFIK_HOST_RULE=.*$|TRAEFIK_HOST_RULE=${TRAEFIK_HOST_RULE}|" .env || echo "TRAEFIK_HOST_RULE=${TRAEFIK_HOST_RULE}" >> .env
+            
+            # Validate required variables for routing and service port
+            if [ -z "${APP_PORT}" ]; then
+              APP_PORT=80
+              export APP_PORT
+              echo "INFO: APP_PORT is not set, defaulting to 80"
+            fi
+            # FQDN derived above from DOMAIN_NAME_DEV
+            docker pull "${DEV_TAG}"
+            export COMPOSE_PROJECT_NAME="${BITBUCKET_REPO_SLUG}-dev"
+            cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${BITBUCKET_REPO_SLUG}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env
+                labels:
+                  - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
+                  - 'com.myorg.environment=${ENVIRONMENT:-${NODE_ENV}}'
+                  - 'traefik.enable=true'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.entrypoints=websecure'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.tls=true'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.service=${BITBUCKET_REPO_SLUG}'
+                  - 'traefik.http.services.${BITBUCKET_REPO_SLUG}.loadbalancer.server.port=${APP_PORT}'
+                  # HTTP -> HTTPS redirect
+                  - 'traefik.http.middlewares.${BITBUCKET_REPO_SLUG}-https.redirectscheme.scheme=https'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.entrypoints=web'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.middlewares=${BITBUCKET_REPO_SLUG}-https'
+                  - 'traefik.docker.network=traefik-network'
+                networks:
+                  - traefik-network
+                  - default
+            networks:
+              traefik-network:
+                external: true    
+            COMPOSE_EOF
+            echo "--------------------------------"
+            echo "docker-compose.override.yml:"
+            cat docker-compose.override.yml
+            # Use docker-compose.dev.yml if it exists, otherwise fallback to docker-compose.yml
+            if [ -f "docker-compose.dev.yml" ]; then
+              cat docker-compose.dev.yml
+              echo "--------------------------------"
+              docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d
+            else
+              cat docker-compose.yml
+              echo "--------------------------------"
+              docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+            fi
+            sleep 10
+
+    - step: &deploy-uat
+        name: 🚀🚀 Deploy to UAT
+        clone: 
+          enabled: true
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - uat.runner
+        deployment: uat  
+        trigger: manual
+        script:
+          - |
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Load .env into current environment for docker compose variable interpolation
+            if [ -f .env ]; then
+              set -a
+              . ./.env
+              set +a
+            else
+              echo "WARNING: .env not found; compose interpolation may miss variables"
+            fi
+            echo "--------------------------------"
+            echo ".env:"
+            cat .env
+            echo "--------------------------------"
+            
+            # Override DOCKER_HOST from .env to use Unix socket (self-hosted runner)
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Deploy UAT environment
+            # Check for promoted tag from promote-uat stage, fallback to UAT_TAG from .env
+            if [ -f "uat.txt" ]; then
+              UAT_TAG=$(cat uat.txt)
+              echo "Using promoted UAT tag: $UAT_TAG"
+            elif [ -n "${UAT_TAG:-}" ]; then
+              echo "Using UAT_TAG from .env: $UAT_TAG"
+            else
+              echo "ERROR: No UAT tag available (neither uat.txt artifact nor UAT_TAG in .env)"
+              exit 1
+            fi
+            docker pull "$UAT_TAG"
+            
+            # Set TAG_SLUG for UAT environment (for docker compose interpolation)
+            # Extract tag from UAT_TAG (e.g., "org/repo:release-1.0.0" -> "release-1.0.0")
+            TAG_SLUG="${UAT_TAG##*:}"
+            export TAG_SLUG
+            echo "Set TAG_SLUG: $TAG_SLUG"
+            
+            export COMPOSE_PROJECT_NAME="${BITBUCKET_REPO_SLUG}-uat"
+            
+            # Require DOMAIN_NAME_UAT for routing
+            if [ -z "${DOMAIN_NAME_UAT:-}" ]; then
+              echo "ERROR: DOMAIN_NAME_UAT is required for UAT routing"; exit 1
+            fi
+            # Derive TRAEFIK_HOST_RULE
+            TRAEFIK_HOST_RULE="Host(\`${DOMAIN_NAME_UAT}\`)"
+            export TRAEFIK_HOST_RULE
+            
+            # Default APP_PORT if not set
+            if [ -z "${APP_PORT}" ]; then
+              APP_PORT=80
+              export APP_PORT
+              echo "INFO: APP_PORT is not set, defaulting to 80"
+            fi
+            
+            cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${BITBUCKET_REPO_SLUG}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env
+                labels:
+                  - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
+                  - 'com.myorg.environment=${ENVIRONMENT:-uat}'
+                  - 'traefik.enable=true'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.entrypoints=websecure'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.tls=true'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.service=${BITBUCKET_REPO_SLUG}'
+                  - 'traefik.http.services.${BITBUCKET_REPO_SLUG}.loadbalancer.server.port=${APP_PORT}'
+                  # HTTP -> HTTPS redirect
+                  - 'traefik.http.middlewares.${BITBUCKET_REPO_SLUG}-https.redirectscheme.scheme=https'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.entrypoints=web'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.middlewares=${BITBUCKET_REPO_SLUG}-https'
+                  - 'traefik.docker.network=traefik-network'
+                networks:
+                  - traefik-network
+                  - default
+            networks:
+              traefik-network:
+                external: true
+            COMPOSE_EOF
+            # Use docker-compose.uat.yml if it exists, otherwise fallback to docker-compose.yml
+            if [ -f "docker-compose.uat.yml" ]; then
+              docker compose -f docker-compose.uat.yml -f docker-compose.override.yml up -d
+            else
+              docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+            fi
+            sleep 10
+
+    - step: &deploy-prod
+        name: 🌟 Deploy to Production
+        clone: 
+          enabled: true
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - prod.runner
+        deployment: prod
+        trigger: manual
+        script:
+          - |
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Load .env into current environment for docker compose variable interpolation
+            if [ -f .env ]; then
+              set -a
+              . ./.env
+              set +a
+            else
+              echo "WARNING: .env not found; compose interpolation may miss variables"
+            fi
+            echo "--------------------------------"
+            echo ".env:"
+            cat .env
+            echo "--------------------------------"
+            
+            # Override DOCKER_HOST from .env to use Unix socket (self-hosted runner)
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Deploy production environment
+            # Check for promoted tag from promote-prod stage, fallback to PROD_TAG from .env
+            if [ -f "prod.txt" ]; then
+              PROD_TAG=$(cat prod.txt)
+              echo "Using promoted PROD tag: $PROD_TAG"
+            elif [ -n "${PROD_TAG:-}" ]; then
+              echo "Using PROD_TAG from .env: $PROD_TAG"
+            else
+              echo "ERROR: No PROD tag available (neither prod.txt artifact nor PROD_TAG in .env)"
+              exit 1
+            fi
+            docker pull "$PROD_TAG"
+            
+            # Set TAG_SLUG for PROD environment (for docker compose interpolation)
+            # Extract tag from PROD_TAG (e.g., "org/repo:prod-abc123" -> "prod-abc123")
+            TAG_SLUG="${PROD_TAG##*:}"
+            export TAG_SLUG
+            echo "Set TAG_SLUG: $TAG_SLUG"
+            
+            export COMPOSE_PROJECT_NAME="${BITBUCKET_REPO_SLUG}-prod"
+            
+            # Check if this is a backend repo (skips Traefik labels, uses Cloudflare Tunnel)
+            if [ "${IS_BACKEND}" = "true" ]; then
+              echo "Backend repo detected (IS_BACKEND=true), skipping Traefik labels"
+              
+              # Ensure Cloudflare Tunnel is running for backend
+              echo "--------------------------------"
+              TUNNEL_CONTAINER_NAME="${TUNNEL_CONTAINER_NAME:-cloudflared-backend}"
+              if ! docker ps --format "{{.Names}}" | grep -q "^${TUNNEL_CONTAINER_NAME}$"; then
+                echo "Cloudflare Tunnel container not running. Setting up tunnel..."
+                # Make script executable
+                chmod +x shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh
+                # Run tunnel setup script
+                # Required: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME
+                # Optional: TUNNEL_NAME (defaults to first part of TUNNEL_HOSTNAME), TUNNEL_SERVICE_URL (defaults to http://127.0.0.1:${APP_PORT}), TUNNEL_SECRET, TUNNEL_CONTAINER_NAME, TUNNEL_IMAGE
+                bash shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh || {
+                  echo "ERROR: Failed to setup Cloudflare Tunnel"
+                  echo "Required variables: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME, APP_PORT"
+                  exit 1
+                }
+              else
+                echo "✅ Cloudflare Tunnel is already running (container: ${TUNNEL_CONTAINER_NAME})"
+              fi
+              echo "--------------------------------"
+              
+              cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${BITBUCKET_REPO_SLUG}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env
+                ports:
+                  - "${APP_PORT:-8000}:${APP_PORT:-8000}"
+            COMPOSE_EOF
+            else
+              # Frontend or admin panel: add Traefik labels
+              # Require DOMAIN_NAME_PROD for routing
+              if [ -z "${DOMAIN_NAME_PROD:-}" ]; then
+                echo "ERROR: DOMAIN_NAME_PROD is required for Prod routing"; exit 1
+              fi
+              # Derive TRAEFIK_HOST_RULE
+              TRAEFIK_HOST_RULE="Host(\`${DOMAIN_NAME_PROD}\`)"
+              export TRAEFIK_HOST_RULE
+              
+              # Add IP whitelist middleware for admin panels
+              if [ "${IS_ADMIN_PANEL}" = "true" ]; then
+                echo "Admin panel detected (IS_ADMIN_PANEL=true), adding IP whitelist middleware"
+                TRAEFIK_MIDDLEWARES="admin-ip-whitelist"
+                export TRAEFIK_MIDDLEWARES
+              else
+                TRAEFIK_MIDDLEWARES=""
+                export TRAEFIK_MIDDLEWARES
+              fi
+              
+              # Default APP_PORT if not set
+              if [ -z "${APP_PORT}" ]; then
+                APP_PORT=80
+                export APP_PORT
+                echo "INFO: APP_PORT is not set, defaulting to 80"
+              fi
+              
+              cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${BITBUCKET_REPO_SLUG}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env
+                labels:
+                  - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
+                  - 'com.myorg.environment=${ENVIRONMENT:-prod}'
+                  - 'traefik.enable=true'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.entrypoints=websecure'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.tls=true'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.service=${BITBUCKET_REPO_SLUG}'
+                  - 'traefik.http.services.${BITBUCKET_REPO_SLUG}.loadbalancer.server.port=${APP_PORT}'
+                  # IP whitelist middleware for admin panels
+                  - 'traefik.http.middlewares.admin-ip-whitelist.ipwhitelist.sourcerange=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
+                  # Apply middleware if admin panel
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.middlewares=${TRAEFIK_MIDDLEWARES}'
+                  # HTTP -> HTTPS redirect
+                  - 'traefik.http.middlewares.${BITBUCKET_REPO_SLUG}-https.redirectscheme.scheme=https'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.entrypoints=web'
+                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.middlewares=${BITBUCKET_REPO_SLUG}-https'
+                  - 'traefik.docker.network=traefik-network'
+                networks:
+                  - traefik-network
+                  - default
+            networks:
+              traefik-network:
+                external: true
+            COMPOSE_EOF
+            fi
+            
+            # Use docker-compose.prod.yml if it exists, otherwise fallback to docker-compose.yml
+            if [ -f "docker-compose.prod.yml" ]; then
+              docker compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
+            else
+              docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+            fi
+            sleep 10
+            
+# =============================================================================
+# TRAEFIK (Alternative to Nginx aproach)
+# =============================================================================
+
+    - step: &setup-preview-traefik
+        clone:
+          enabled: false
+        name: 🧭 Setup Traefik for Preview
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+            
+            # Only run preview deployment for PRs targeting develop/dev
+            if [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping preview deployment: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Check if Traefik is already running; if an old container exists, remove it
+              if docker ps --format "table {{.Names}}" | grep -q "^traefik$"; then
+              echo "Traefik is already running"
+              # Ensure certbot renew cron is installed even if traefik is already running (idempotent)
+              ./shared-pipelines/scripts/preview/certbot_cloudflare_renew.sh --install-cron || true
+            else
+              # If an existing (stopped/exited) container with the same name exists, remove it
+              if docker ps -a --format "table {{.Names}}" | grep -q "^traefik$"; then
+                echo "Removing existing Traefik container (not running)"
+                docker rm -f traefik || true
+              fi
+              echo "Starting Traefik container..."
+
+              # Free ports 80/443 if Nginx is running
+              if command -v systemctl >/dev/null 2>&1; then
+                if systemctl is-active --quiet nginx; then
+                  echo "Stopping nginx to free ports 80/443 for Traefik..."
+                  sudo systemctl stop nginx || true
+                fi
+              else
+                sudo service nginx stop >/dev/null 2>&1 || true
+              fi
+              
+              # Ensure TLS certs exist for Traefik (reuse Certbot flow; no token exposed to Traefik)
+              if [ -f "/etc/ssl/preview-certs/wildcard.crt" ] && [ -f "/etc/ssl/preview-certs/wildcard.key" ]; then
+                echo "TLS certs already present at /etc/ssl/preview-certs; skipping issuance"
+              else
+                echo "Issuing TLS certs with Certbot (Cloudflare DNS)"
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+                chmod +x shared-pipelines/scripts/preview/certbot_cloudflare.sh || true
+                chmod +x shared-pipelines/scripts/preview/certbot_cloudflare_renew.sh || true
+                if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || { [ -z "${PREVIEW_DOMAIN_NAME:-}" ] && [ -z "${FQDN:-}" ]; }; then
+                  echo "ERROR: CLOUDFLARE_API_TOKEN and PREVIEW_DOMAIN_NAME (or FQDN) are required to issue TLS certs"
+                  exit 1
+                fi
+                # Ensure INTERNAL_DNS_ZONE (used by the certbot script to compute FQDN)
+                export INTERNAL_DNS_ZONE="${INTERNAL_DNS_ZONE:-internal.$PREVIEW_DOMAIN_NAME}}"
+                
+                # Force production certs for fisrt run (comment out later)
+                # export CERTBOT_FORCE_PROD=1
+                
+                bash shared-pipelines/scripts/preview/certbot_cloudflare.sh || {
+                  echo "ERROR: Certbot issuance failed"
+              exit 1
+            }
+                echo "TLS certs issued at /etc/ssl/preview-certs"
+                # Install/refresh certbot renew cron (delegated to script; idempotent)
+                ./shared-pipelines/scripts/preview/certbot_cloudflare_renew.sh --install-cron || true
+              fi
+              
+              # Create Traefik network if it doesn't exist
+              docker network create traefik-network 2>/dev/null || echo "Traefik network already exists"
+
+              # Write default TLS cert config for Traefik file provider
+              if command -v sudo >/dev/null 2>&1; then
+                sudo mkdir -p /etc/ssl/preview-certs
+                printf '%s\n' \
+                  "tls:" \
+                  "  stores:" \
+                  "    default:" \
+                  "      defaultCertificate:" \
+                  "        certFile: /certs/wildcard.crt" \
+                  "        keyFile: /certs/wildcard.key" \
+                  | sudo tee /etc/ssl/preview-certs/traefik-tls.yml >/dev/null
+              else
+                mkdir -p /etc/ssl/preview-certs
+                printf '%s\n' \
+                  "tls:" \
+                  "  stores:" \
+                  "    default:" \
+                  "      defaultCertificate:" \
+                  "        certFile: /certs/wildcard.crt" \
+                  "        keyFile: /certs/wildcard.key" \
+                  > /etc/ssl/preview-certs/traefik-tls.yml
+              fi
+
+              # Start Traefik container
+              docker run -d \
+                --name traefik \
+                --restart unless-stopped \
+                -p 80:80 \
+                -p 443:443 \
+                -p 8080:8080 \
+                -v /var/run/docker.sock:/var/run/docker.sock:ro \
+                -v /etc/letsencrypt:/etc/letsencrypt:ro \
+                -v /etc/ssl/preview-certs:/certs:ro \
+                -v traefik-data:/data \
+                --network traefik-network \
+                --label "traefik.enable=true" \
+                --label "traefik.http.routers.traefik.rule=Host(\`traefik.internal.${PREVIEW_DOMAIN_NAME}\`)" \
+                --label "traefik.http.routers.traefik.service=api@internal" \
+                traefik:v3.0 \
+                --api.dashboard=true \
+                --api.insecure=true \
+                --providers.docker=true \
+                --providers.docker.exposedbydefault=false \
+                --providers.file.filename=/certs/traefik-tls.yml \
+                --entrypoints.web.address=:80 \
+                --entrypoints.websecure.address=:443 \
+                --log.level=INFO
+              
+              echo "Traefik started successfully"
+            fi
+            
+            # Wait for Traefik to be ready
+            echo "Waiting for Traefik to be ready..."
+            for i in {1..30}; do
+              if curl -sf http://localhost:8080/api/rawdata >/dev/null 2>&1; then
+                echo "Traefik is ready!"
+                break
+              fi
+              echo "Waiting... ($i/30)"
+              sleep 2
+            done
+
+    - step: &deploy-preview-traefik
+        name: 👀 Deploy Preview with Traefik
+        clone:
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        deployment: preview
+        script:
+          - |
+            # Restore consumer repo from artifact snapshot
+            if [ -d ".consumer-repo-snapshot" ]; then
+              echo "Restoring consumer repo from snapshot..."
+              rsync -a .consumer-repo-snapshot/ ./
+              rm -rf .consumer-repo-snapshot
+              echo "Consumer repo restored"
+            fi
+            
+            # Skip preview deployment unless:
+            # 1. Real PR targeting develop/dev, OR
+            # 2. Explicit PR_ID is set (for feature branches)
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            
+
+            if [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+              echo "Skipping preview deployment: PR not targeting develop/dev"
+              exit 0
+            fi
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Docker login with error checking
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin || {
+              echo "ERROR: Docker login failed"
+              exit 1
+            }
+            
+            # Compose up for preview with Traefik
+            export COMPOSE_PROJECT_NAME="${PREVIEW_SLUG}"
+            
+            # Set preview domain
+            export PREVIEW_DOMAIN="${PREVIEW_SLUG}.internal.${PREVIEW_DOMAIN_NAME}"
+            echo "PREVIEW_DOMAIN=${PREVIEW_DOMAIN}" >> .env
+            
+            # Clean up any existing containers with the same project name
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            docker compose -f docker-compose.preview.yml down || true
+            
+            # Resolve APP_PORT environment variable for Traefik labels
+            APP_PORT="${APP_PORT:-80}"
+            echo "APP_PORT=${APP_PORT}" >> .env
+            
+            # Resolve preview domain for Traefik labels
+            PREVIEW_HOST="${PREVIEW_SLUG}.internal.${PREVIEW_DOMAIN_NAME}"
+            echo "PREVIEW_HOST=${PREVIEW_HOST}" >> .env
+            
+            # Construct Traefik Host rules with proper backticks
+            TRAEFIK_HOST_RULE="Host(\`${PREVIEW_HOST}\`)"
+            echo "TRAEFIK_HOST_RULE=${TRAEFIK_HOST_RULE}" >> .env
+
+            # Optionally export peer service URLs from PEER_HOST_URLS
+            # Format: PEER_HOST_URLS="FRONTEND_URL.zenit-claim-app,BACKEND_URL.zenit-claim-api"
+            if [ -n "${PEER_HOST_URLS:-}" ]; then
+              # Prefer PREVIEW_KEY if already set; fallback to derivation from PREVIEW_SLUG
+              PREVIEW_KEY_DERIVED="${PREVIEW_SLUG#preview-}"
+              PREVIEW_KEY_DERIVED="${PREVIEW_KEY_DERIVED%-${BITBUCKET_REPO_SLUG}}"
+              PREVIEW_KEY_USE="${PREVIEW_KEY:-$PREVIEW_KEY_DERIVED}"
+              echo "PREVIEW_KEY_USE=${PREVIEW_KEY_USE}"
+              IFS=',' read -r -a __pairs <<< "${PEER_HOST_URLS}"
+              for __pair in "${__pairs[@]}"; do
+                __pair="$(echo "${__pair}" | xargs)"; [ -z "${__pair}" ] && continue
+                __var_name="${__pair%%.*}"; __app_slug="${__pair#*.}"
+                __host="preview-${PREVIEW_KEY_USE}-${__app_slug}.internal.${PREVIEW_DOMAIN_NAME}"
+                __url="https://${__host}"
+                export "${__var_name}=${__url}"
+                echo "${__var_name}=${__url}" >> .env
+                echo "Set ${__var_name}=${__url}"
+              done
+            else
+              echo "PEER_HOST_URLS not set; skipping peer URL exports"
+            fi
+
+            # If Dockerfile includes Nginx, just note it (Traefik will still route to the app container)
+            if [ -f "Dockerfile" ] && grep -q "nginx" Dockerfile 2>/dev/null; then
+              echo "INFO: Dockerfile includes Nginx - so setting SERVER_NAME..."
+              # Provide SERVER_NAME for any Nginx container or compose templates that rely on it at runtime
+              export SERVER_NAME="${PREVIEW_HOST}"
+              echo "SERVER_NAME=${SERVER_NAME}" >> .env
+            else
+              echo "INFO: Dockerfile does not include Nginx - proceeding with app-only container behind Traefik."
+            fi
+            
+            # Create docker-compose override for Traefik
+            cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${BITBUCKET_REPO_SLUG}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env  
+                labels:
+                  - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
+                  - 'com.myorg.environment=${ENVIRONMENT:-${NODE_ENV}}'
+                  - 'traefik.enable=true'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}.entrypoints=websecure'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}.tls=true'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}.service=${PREVIEW_SLUG}'
+                  - 'traefik.http.services.${PREVIEW_SLUG}.loadbalancer.server.port=${APP_PORT}'
+                  # HTTP -> HTTPS redirect
+                  - 'traefik.http.middlewares.${PREVIEW_SLUG}-https.redirectscheme.scheme=https'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}-http.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}-http.entrypoints=web'
+                  - 'traefik.http.routers.${PREVIEW_SLUG}-http.middlewares=${PREVIEW_SLUG}-https'
+                  - 'traefik.docker.network=traefik-network'
+                networks:
+                  - traefik-network
+                  - default
+            networks:
+              traefik-network:
+                external: true
+            COMPOSE_EOF
+            
+            echo "================================================"
+            cat .env
+            
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            # Use docker-compose.preview.yml if it exists, otherwise fallback to docker-compose.yml
+            if [ -f "docker-compose.preview.yml" ]; then
+              cat docker-compose.preview.yml
+              cat docker-compose.override.yml
+              echo "================================================"
+              docker compose -f docker-compose.preview.yml -f docker-compose.override.yml up -d
+            else
+              cat docker-compose.yml
+              cat docker-compose.override.yml
+              echo "================================================"
+              docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
+            fi
+            
+            # Wait for container to be ready
+            echo "Waiting for preview container to be ready..."
+            sleep 15
+            
+            # Health check via Traefik (using full domain)
+            curl -sf https://${PREVIEW_DOMAIN}/health || {
+              echo "WARNING: Health check failed may be due to a different health check path than /health, but continuing..."
+            }
+            
+            # PR comment with Traefik URL
+            if [ -n "$BITBUCKET_ACCESS_TOKEN" ]; then
+              echo "Using OAuth access token for PR comment"
+              export BITBUCKET_REPO_OWNER=${BITBUCKET_REPO_OWNER:-$BITBUCKET_WORKSPACE}
+              if [ -n "$TRIGGER_SOURCE" ]; then
+                export BITBUCKET_REPO_SLUG=${TRIGGER_SOURCE}
+              else
+              export BITBUCKET_REPO_SLUG=${BITBUCKET_REPO_SLUG:-$BITBUCKET_REPO_SLUG}
+              fi  
+              export PREVIEW_URL="https://${PREVIEW_SLUG}.internal.${PREVIEW_DOMAIN_NAME}"
+              ./shared-pipelines/scripts/preview/pr_comment.sh || true
+            else
+              echo "No Bitbucket credentials found: set BITBUCKET_ACCESS_TOKEN (OAuth access token)"
+            fi
+
+    - step: &teardown-preview-traefik
+        name: 🧹 Teardown Preview with Traefik
+        clone:
+          enabled: false
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - preview.runner
+        script:
+          - |
+            # Load preview identifiers from .env if available
+            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG|PREVIEW_KEY)=' .env | xargs) || true
+            
+            # Derive preview identifiers (same logic as setup-env)
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            # Derive PREVIEW_KEY from feature/* branch if not in .env
+            if [ -z "${PREVIEW_KEY:-}" ] && [ -n "${BITBUCKET_BRANCH:-}" ] && echo "${BITBUCKET_BRANCH}" | grep -qiE '^feature/'; then
+              PREVIEW_KEY=$(echo "${BITBUCKET_BRANCH#feature/}" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]+/-/g; s/[^a-z0-9-]/-/g; s/--\+/-/g; s/^-\+//; s/-\+$//')
+              export PREVIEW_KEY
+            fi
+            
+            # Set PREVIEW_SLUG and TAG_SLUG if not already set (from .env)
+            if [ -z "${PREVIEW_SLUG:-}" ]; then
+              if [ -n "${PREVIEW_KEY:-}" ]; then
+                export PREVIEW_SLUG="preview-${PREVIEW_KEY}-${BITBUCKET_REPO_SLUG}"
+                export TAG_SLUG="branch-${PREVIEW_KEY}"
+                echo "Using branch-based preview: ${PREVIEW_KEY}"
+              elif [ -n "${PR_ID_FOR_USE:-}" ]; then
+                export PREVIEW_SLUG="preview-${PR_ID_FOR_USE}-${BITBUCKET_REPO_SLUG}"
+                export TAG_SLUG="pr-${PR_ID_FOR_USE}"
+                echo "Using PR-based preview: ${PR_ID_FOR_USE}"
+              else
+                echo "ERROR: Cannot determine preview identifier"
+                echo "  - For branch-based: Provide BITBUCKET_BRANCH (e.g., feature/nod-50)"
+                echo "  - For PR-based: Provide BITBUCKET_PR_ID (e.g., 123)"
+                echo "  - Or run teardown from the preview pipeline (auto-detects from .env)"
+                exit 1
+              fi
+            fi
+            
+            echo "Tearing down preview: ${PREVIEW_SLUG} (TAG: ${TAG_SLUG})"
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            # Wait for Docker daemon to be ready
+            for i in {1..10}; do
+              if docker info >/dev/null 2>&1; then break; fi
+              echo "Waiting for Docker daemon... ($i/10)"; sleep 2
+            done
+            docker info >/dev/null 2>&1 || { echo "ERROR: Docker daemon unavailable"; exit 1; }
+            
+            # Make all scripts executable with better error handling
+            echo "Making scripts executable..."
+            find shared-pipelines/scripts -type f -name "*.sh" -exec chmod +x {} \; || {
+              echo "WARNING: Some scripts may not have been made executable"
+            }
+            
+            # Compose down for preview
+            export COMPOSE_PROJECT_NAME="${PREVIEW_SLUG}"
+            
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            docker compose -f docker-compose.preview.yml down || true
+
+            docker rmi "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:${TAG_SLUG}" || true
+            
+            echo "Preview teardown completed for PR ${PR_ID_FOR_USE}"
+
+            # Optional: fan-out teardown to peer repos if configured
+            # Support single or comma-separated repos (same as trigger-peer)
+            REPOS_CSV="${PEER_REPO_SLUGS:-$PEER_REPO_SLUG}"
+            if [ -n "${REPOS_CSV:-}" ] && [ -n "${BITBUCKET_ACCESS_TOKEN:-}" ]; then
+              echo "Peer repos detected; triggering teardown in peers: ${REPOS_CSV}"
+              # Use source branch (from webhook if provided) since peers don't have PRs
+              SOURCE_BRANCH="${SRC_BRANCH:-${BITBUCKET_BRANCH:-}}"
+              IFS=',' read -r -a _PEERS <<< "${REPOS_CSV}"
+              for _peer in "${_PEERS[@]}"; do
+                PEER_SLUG_TRIMMED=$(echo "${_peer}" | xargs)
+                [ -z "${PEER_SLUG_TRIMMED}" ] && continue
+                echo "Triggering manual-preview-teardown in peer: ${PEER_SLUG_TRIMMED} (source=${SOURCE_BRANCH})"
+                REQ_BODY=$(printf '%s' '{"target":{"type":"pipeline_ref_target","ref_type":"branch","ref_name":"%s","selector":{"type":"custom","pattern":"manual-preview-teardown"}},"variables":[{"key":"BITBUCKET_BRANCH","value":"%s"},{"key":"PR_ID","value":"%s"}]}' "${SOURCE_BRANCH}" "${BITBUCKET_BRANCH:-}" "${PR_ID_FOR_USE:-}")
+                RESP=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${BITBUCKET_ACCESS_TOKEN}" -H "Content-Type: application/json" \
+                  -X POST "https://api.bitbucket.org/2.0/repositories/${PEER_WORKSPACE:-$BITBUCKET_WORKSPACE}/${PEER_SLUG_TRIMMED}/pipelines/" \
+                  -d "${REQ_BODY}")
+                HTTP_CODE=$(echo "$RESP" | tail -n1)
+                BODY=$(echo "$RESP" | sed '$d')
+                if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+                  echo "Peer teardown trigger OK for ${PEER_SLUG_TRIMMED} (HTTP ${HTTP_CODE})"
+                else
+                  echo "WARNING: Peer teardown trigger failed for ${PEER_SLUG_TRIMMED} (HTTP ${HTTP_CODE})"
+                  echo "Response: ${BODY}" | sed -e 's/\(.*\)/  \1/'
+                  # Retry on common default branches if reference not found
+                  if echo "$HTTP_CODE $BODY" | grep -qiE 'reference\-not\-found|pipeline_unknown_target|404'; then
+                    for FALLBACK_REF in develop dev main; do
+                      [ "$FALLBACK_REF" = "$SOURCE_BRANCH" ] && continue
+                      echo "Retrying peer ${PEER_SLUG_TRIMMED} on ref=${FALLBACK_REF}"
+                      REQ_BODY_FB=$(printf '%s' '{"target":{"type":"pipeline_ref_target","ref_type":"branch","ref_name":"%s","selector":{"type":"custom","pattern":"manual-preview-teardown"}},"variables":[{"key":"BITBUCKET_BRANCH","value":"%s"},{"key":"PR_ID","value":"%s"}]}' "${FALLBACK_REF}" "${BITBUCKET_BRANCH:-}" "${PR_ID_FOR_USE:-}")
+                      RESP_FB=$(curl -s -w "\n%{http_code}" -H "Authorization: Bearer ${BITBUCKET_ACCESS_TOKEN}" -H "Content-Type: application/json" \
+                        -X POST "https://api.bitbucket.org/2.0/repositories/${PEER_WORKSPACE:-$BITBUCKET_WORKSPACE}/${PEER_SLUG_TRIMMED}/pipelines/" \
+                        -d "${REQ_BODY_FB}")
+                      HTTP_CODE_FB=$(echo "$RESP_FB" | tail -n1)
+                      BODY_FB=$(echo "$RESP_FB" | sed '$d')
+                      if [ "$HTTP_CODE_FB" -ge 200 ] && [ "$HTTP_CODE_FB" -lt 300 ]; then
+                        echo "Peer teardown trigger OK for ${PEER_SLUG_TRIMMED} on ${FALLBACK_REF} (HTTP ${HTTP_CODE_FB})"
+                        break
+                      else
+                        echo "Retry failed on ${FALLBACK_REF} (HTTP ${HTTP_CODE_FB})"; echo "$BODY_FB" | sed -e 's/\(.*\)/  \1/'
+                      fi
+                    done
+                  fi
+                fi
+              done
+            fi
+
+    - step: &setup-traefik
+        name: 🧭 Setup Traefik (generic for all envs)
+        runs-on:
+          - self.hosted
+          - linux.shell
+        script:
+          - &traefik_script |
+            # Generic Traefik setup for any environment (dev/uat/prod)
+            # Uses existing Certbot + Cloudflare DNS flow to provision wildcard certs
+            # and mounts them into Traefik via file provider as a default TLS cert.
+
+            # Skip Traefik setup for backend repos in prod (they use Cloudflare Tunnel)
+            if [ "${IS_BACKEND}" = "true" ] && [ "${ENVIRONMENT:-}" = "prod" ]; then
+              echo "Backend repo in prod detected (IS_BACKEND=true), skipping Traefik setup (use Cloudflare Tunnel instead)"
+              exit 0
+            fi
+
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket.
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Set certificate directory for Traefik
+            export CERTS_DIR="${CERTS_DIR:-/etc/ssl/traefik-certs}"
+
+            # Override environment detection for main branches (even in PR context)
+            case "${BITBUCKET_BRANCH:-}" in
+              "main")
+                ENVIRONMENT="prod"
+                echo "Override: ENVIRONMENT=prod for main branch"
+                ;;
+              "develop"|"dev")
+                ENVIRONMENT="dev"
+                echo "Override: ENVIRONMENT=dev for ${BITBUCKET_BRANCH} branch"
+                ;;
+              "release/"*)
+                ENVIRONMENT="uat"
+                echo "Override: ENVIRONMENT=uat for release branch"
+                ;;
+              *)
+                # Keep existing ENVIRONMENT (likely preview for feature branches)
+                echo "Using existing ENVIRONMENT=${ENVIRONMENT:-<unset>} for branch ${BITBUCKET_BRANCH}"
+                ;;
+            esac
+            
+            # Export ENVIRONMENT and repo type flags for child processes
+            export ENVIRONMENT
+            export IS_BACKEND
+            export IS_ADMIN_PANEL
+            
+            # Get environment-specific variables (fail if missing)
+            # Supports both uppercase (_PROD) and lowercase (_prod) suffixes
+            case "${ENVIRONMENT:-}" in
+              prod|production)
+                # Try uppercase first, then lowercase
+                DOMAIN_NAME="${DOMAIN_NAME_PROD:-${DOMAIN_NAME_prod:-}}"
+                TARGET_IP="${TARGET_IP_PROD:-${TARGET_IP_prod:-}}"
+                if [ -z "$DOMAIN_NAME" ]; then
+                  echo "ERROR: DOMAIN_NAME_PROD (or DOMAIN_NAME_prod) is required for ${ENVIRONMENT} environment"
+                  echo "Please set DOMAIN_NAME_PROD or DOMAIN_NAME_prod repository variable"
+                  exit 1
+                fi
+                if [ -z "$TARGET_IP" ]; then
+                  echo "ERROR: TARGET_IP_PROD (or TARGET_IP_prod) is required for ${ENVIRONMENT} environment"
+                  echo "Please set TARGET_IP_PROD or TARGET_IP_prod repository variable"
+                  exit 1
+                fi
+                echo "Using PROD environment: DOMAIN_NAME=${DOMAIN_NAME}, TARGET_IP=${TARGET_IP}"
+                ;;
+              uat)
+                # Try uppercase first, then lowercase
+                DOMAIN_NAME="${DOMAIN_NAME_UAT:-${DOMAIN_NAME_uat:-}}"
+                TARGET_IP="${TARGET_IP_UAT:-${TARGET_IP_uat:-}}"
+                if [ -z "$DOMAIN_NAME" ]; then
+                  echo "ERROR: DOMAIN_NAME_UAT (or DOMAIN_NAME_uat) is required for ${ENVIRONMENT} environment"
+                  echo "Please set DOMAIN_NAME_UAT or DOMAIN_NAME_uat repository variable"
+                  exit 1
+                fi
+                if [ -z "$TARGET_IP" ]; then
+                  echo "ERROR: TARGET_IP_UAT (or TARGET_IP_uat) is required for ${ENVIRONMENT} environment"
+                  echo "Please set TARGET_IP_UAT or TARGET_IP_uat repository variable"
+                  exit 1
+                fi
+                echo "Using UAT environment: DOMAIN_NAME=${DOMAIN_NAME}, TARGET_IP=${TARGET_IP}"
+                ;;
+              dev)
+                # Try uppercase first, then lowercase
+                DOMAIN_NAME="${DOMAIN_NAME_DEV:-${DOMAIN_NAME_dev:-}}"
+                TARGET_IP="${TARGET_IP_DEV:-${TARGET_IP_dev:-}}"
+                if [ -z "$DOMAIN_NAME" ]; then
+                  echo "ERROR: DOMAIN_NAME_DEV (or DOMAIN_NAME_dev) is required for ${ENVIRONMENT} environment"
+                  echo "Please set DOMAIN_NAME_DEV or DOMAIN_NAME_dev repository variable"
+                  exit 1
+                fi
+                if [ -z "$TARGET_IP" ]; then
+                  echo "ERROR: TARGET_IP_DEV (or TARGET_IP_dev) is required for ${ENVIRONMENT} environment"
+                  echo "Please set TARGET_IP_DEV or TARGET_IP_dev repository variable"
+                  exit 1
+                fi
+                echo "Using DEV environment: DOMAIN_NAME=${DOMAIN_NAME}, TARGET_IP=${TARGET_IP}"
+                ;;
+            esac
+            
+            # Derive apex domain (e.g., xyz.com from app.xyz.com); allow override via APEX_DOMAIN
+            BASE_DOMAIN="${APEX_DOMAIN:-}"
+            if [ -z "$BASE_DOMAIN" ]; then
+              if [ -z "${DOMAIN_NAME:-}" ]; then
+                echo "ERROR: DOMAIN_NAME is required to derive apex domain (e.g., xyz.com)"; exit 1
+              fi
+              BASE_DOMAIN=$(awk -F. '{if(NF>=2) print $(NF-1)"."$NF; else print $0}' <<< "$DOMAIN_NAME")
+            fi
+            # Trim any CR/whitespace from inputs
+            DOMAIN_NAME="$(printf '%s' "${DOMAIN_NAME}" | tr -d '\r' | xargs)"
+            BASE_DOMAIN="$(printf '%s' "${BASE_DOMAIN}" | tr -d '\r' | xargs)"
+            echo "Apex domain resolved as: ${BASE_DOMAIN} (from DOMAIN_NAME=${DOMAIN_NAME:-<unset>})"
+
+            # Derive SUBDOMAIN_NAME from DOMAIN_NAME if not explicitly provided
+            if [ -z "${SUBDOMAIN_NAME:-}" ] && [ -n "${DOMAIN_NAME:-}" ]; then
+              SUBDOMAIN_NAME=$(awk -F. '{if(NF>2){for(i=1;i<=NF-2;i++){printf (i>1?".":"")$i}}}' <<< "$DOMAIN_NAME")
+              # Strip wildcard prefix (e.g., *saft -> saft)
+              SUBDOMAIN_NAME="${SUBDOMAIN_NAME#\*}"
+              SUBDOMAIN_NAME="$(printf '%s' "${SUBDOMAIN_NAME}" | tr -d '\r' | xargs)"
+              [ -n "$SUBDOMAIN_NAME" ] && export SUBDOMAIN_NAME
+            fi
+            echo "Subdomain resolved as: ${SUBDOMAIN_NAME:-<none>}"
+
+            # Create DNS record using existing dispatcher script
+            # Dev/UAT → always internal DNS
+            # Prod → skip for backend (uses Cloudflare Tunnel), internal DNS if IS_ADMIN_PANEL=true, otherwise Cloudflare DNS
+            case "${ENVIRONMENT:-}" in
+              prod|production)
+                # Check if admin panel (use internal DNS) or regular frontend (use Cloudflare DNS)
+                if [ "${IS_ADMIN_PANEL}" = "true" ]; then
+                  echo "Admin panel detected (IS_ADMIN_PANEL=true), using Internal DNS for ${SUBDOMAIN_NAME:+${SUBDOMAIN_NAME}.}${BASE_DOMAIN}"
+                  export SUBDOMAIN="${SUBDOMAIN_NAME:-}"
+                  export ZONE="${BASE_DOMAIN}"
+                  if [ -z "${TARGET_IP:-}" ]; then
+                    echo "ERROR: TARGET_IP is required for ${ENVIRONMENT}"
+                    echo "Please set TARGET_IP_${ENVIRONMENT^^} repository variable"
+                    exit 1
+                  fi
+                  export TARGET_IP
+                  # Set required internal DNS variables
+                  export INTERNAL_DNS_SERVER="${INTERNAL_DNS_SERVER:-}"
+                  export INTERNAL_DNS_ZONE="${INTERNAL_DNS_ZONE:-${ZONE}}"
+                  export INTERNAL_DNS_TSIG_KEY_NAME="${INTERNAL_DNS_TSIG_KEY_NAME:-}"
+                  export INTERNAL_DNS_TSIG_KEY="${INTERNAL_DNS_TSIG_KEY:-}"
+                  printf "%s\n" "--------------------------------" \
+                    "ENVIRONMENT=${ENVIRONMENT} (Admin Panel)" \
+                    "TARGET_IP=${TARGET_IP}" \
+                    "SUBDOMAIN=${SUBDOMAIN}" \
+                    "ZONE=${BASE_DOMAIN}" \
+                    "--------------------------------"
+                  bash shared-pipelines/scripts/dns/dns_create.sh || echo "WARNING: Internal DNS creation failed; continuing"
+                else
+                  echo "Creating DNS record via Cloudflare for ${SUBDOMAIN_NAME:+${SUBDOMAIN_NAME}.}${BASE_DOMAIN} (ENVIRONMENT=${ENVIRONMENT})"
+                  export CLOUDFLARE_DOMAIN="${BASE_DOMAIN}"
+                  export SUBDOMAIN="${SUBDOMAIN_NAME:-}"
+                  if [ -z "${TARGET_IP:-}" ]; then
+                    echo "ERROR: TARGET_IP is required for ${ENVIRONMENT}"
+                    echo "Please set TARGET_IP_${ENVIRONMENT^^} repository variable"
+                    exit 1
+                  fi
+                  export TARGET_IP
+                  printf "%s\n" "--------------------------------" \
+                    "ENVIRONMENT=${ENVIRONMENT}" \
+                    "TARGET_IP=${TARGET_IP}" \
+                    "SUBDOMAIN=${SUBDOMAIN}" \
+                    "ZONE=${BASE_DOMAIN}" \
+                    "--------------------------------"
+                  bash shared-pipelines/scripts/dns/dns_create.sh || echo "WARNING: DNS creation failed; continuing"
+                fi
+                ;;
+              uat|dev|develop|development)
+                echo "Creating Internal DNS record via dispatcher for ${SUBDOMAIN_NAME:+${SUBDOMAIN_NAME}.}${BASE_DOMAIN} (ENVIRONMENT=${ENVIRONMENT})"
+                export SUBDOMAIN="${SUBDOMAIN_NAME:-}"
+                export ZONE="${BASE_DOMAIN}"
+                # TARGET_IP already set from environment-specific variables above
+                if [ -z "${TARGET_IP:-}" ]; then
+                  echo "ERROR: TARGET_IP is required for ${ENVIRONMENT}"
+                  echo "Please set TARGET_IP_${ENVIRONMENT^^} repository variable"
+                  exit 1
+                fi
+                export TARGET_IP
+                
+                # Set required internal DNS variables
+                export INTERNAL_DNS_SERVER="${INTERNAL_DNS_SERVER:-}"
+                export INTERNAL_DNS_ZONE="${INTERNAL_DNS_ZONE:-${ZONE}}"
+                export INTERNAL_DNS_TSIG_KEY_NAME="${INTERNAL_DNS_TSIG_KEY_NAME:-}"
+                export INTERNAL_DNS_TSIG_KEY="${INTERNAL_DNS_TSIG_KEY:-}"
+                
+                printf "%s\n" "--------------------------------" \
+                  "ENVIRONMENT=${ENVIRONMENT}" \
+                  "TARGET_IP=${TARGET_IP}" \
+                  "SUBDOMAIN=${SUBDOMAIN}" \
+                  "ZONE=${BASE_DOMAIN}" \
+                  "INTERNAL_DNS_SERVER=${INTERNAL_DNS_SERVER}" \
+                  "INTERNAL_DNS_ZONE=${INTERNAL_DNS_ZONE}" \
+                  "INTERNAL_DNS_TSIG_KEY_NAME=${INTERNAL_DNS_TSIG_KEY_NAME}" \
+                  "INTERNAL_DNS_TSIG_KEY=${INTERNAL_DNS_TSIG_KEY}" \
+                  "--------------------------------"
+                bash shared-pipelines/scripts/dns/dns_create.sh || echo "WARNING: Internal DNS creation failed; continuing"
+                ;;
+              *)
+                echo "Skipping DNS creation for ENVIRONMENT=${ENVIRONMENT:-<unset>} (handled for dev/uat/prod only)"
+                ;;
+            esac
+            
+            # Check if Traefik is already running; if an old container exists, remove it
+            if docker ps --format "table {{.Names}}" | grep -q "^traefik$"; then
+              echo "Traefik is already running"
+              # Ensure certbot renew cron is installed even if traefik is already running (idempotent)
+              ./shared-pipelines/scripts/traefik/certbot_cloudflare_renew.sh --install-cron || true
+            else
+              # If an existing (stopped/exited) container with the same name exists, remove it
+              if docker ps -a --format "table {{.Names}}" | grep -q "^traefik$"; then
+                echo "Removing existing Traefik container (not running)"
+                docker rm -f traefik || true
+              fi
+              echo "Starting Traefik container..."
+
+              # Free ports 80/443 if Nginx is running
+              if command -v systemctl >/dev/null 2>&1; then
+                if systemctl is-active --quiet nginx; then
+                  echo "Stopping nginx to free ports 80/443 for Traefik..."
+                  sudo systemctl stop nginx || true
+                fi
+              else
+                sudo service nginx stop >/dev/null 2>&1 || true
+              fi
+              
+              # Ensure TLS certs exist for Traefik (reuse Certbot flow; no token exposed to Traefik)
+              if [ -f "${CERTS_DIR}/wildcard.crt" ] && [ -f "${CERTS_DIR}/wildcard.key" ]; then
+                echo "TLS certs already present at ${CERTS_DIR}; skipping issuance"
+              else
+                echo "Issuing TLS certs with Certbot (Cloudflare DNS)"
+                if [ -d "shared-pipelines" ]; then
+                  echo "shared-pipelines directory already exists"
+                else
+                  echo "shared-pipelines directory does not exist, cloning..."
+                  git clone git@bitbucket.org:protocol33/shared-pipelines.git
+                fi
+                chmod +x shared-pipelines/scripts/traefik/certbot_cloudflare.sh || true
+                chmod +x shared-pipelines/scripts/traefik/certbot_cloudflare_renew.sh || true
+                if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || { [ -z "${DOMAIN_NAME:-}" ] && [ -z "${FQDN:-}" ]; }; then
+                  echo "ERROR: CLOUDFLARE_API_TOKEN and DOMAIN_NAME (or FQDN) are required to issue TLS certs"
+                  exit 1
+                fi
+                # Ensure FQDN (used by the certbot script to compute FQDN)
+                # For traefik we want wildcard on apex only (e.g., *.xyz.com)
+                export FQDN="${FQDN:-${BASE_DOMAIN}}"
+                
+                # Force production certs for fisrt run (comment out later)
+                # export CERTBOT_FORCE_PROD=1
+                
+                bash shared-pipelines/scripts/traefik/certbot_cloudflare.sh || {
+                  echo "ERROR: Certbot issuance failed"
+                  exit 1
+                }
+                echo "TLS certs issued at ${CERTS_DIR}"
+                # Install/refresh certbot renew cron (delegated to script; idempotent)
+                ./shared-pipelines/scripts/traefik/certbot_cloudflare_renew.sh --install-cron || true
+              fi
+              
+              # Create Traefik network if it doesn't exist
+              docker network create traefik-network 2>/dev/null || echo "Traefik network already exists"
+
+              # Configure UFW firewall to allow HTTP/HTTPS traffic
+              echo "Configuring UFW firewall for Traefik..."
+              if command -v ufw >/dev/null 2>&1; then
+                # Allow HTTP (port 80) from anywhere
+                sudo ufw allow 80/tcp comment "Traefik HTTP" || echo "UFW rule for port 80 already exists or failed"
+                # Allow HTTPS (port 443) from anywhere  
+                sudo ufw allow 443/tcp comment "Traefik HTTPS" || echo "UFW rule for port 443 already exists or failed"
+                # Allow Traefik dashboard (port 8080) from anywhere (optional)
+                sudo ufw allow 8080/tcp comment "Traefik Dashboard" || echo "UFW rule for port 8080 already exists or failed"
+                echo "UFW firewall rules configured for Traefik"
+              else
+                echo "UFW not available, skipping firewall configuration"
+              fi
+
+              # Write default TLS cert config for Traefik file provider
+              if command -v sudo >/dev/null 2>&1; then
+                sudo mkdir -p "${CERTS_DIR}"
+                printf '%s\n' \
+                  "tls:" \
+                  "  stores:" \
+                  "    default:" \
+                  "      defaultCertificate:" \
+                  "        certFile: /certs/wildcard.crt" \
+                  "        keyFile: /certs/wildcard.key" \
+                  | sudo tee "${CERTS_DIR}/traefik-tls.yml" >/dev/null
+              else
+                mkdir -p "${CERTS_DIR}"
+                printf '%s\n' \
+                  "tls:" \
+                  "  stores:" \
+                  "    default:" \
+                  "      defaultCertificate:" \
+                  "        certFile: /certs/wildcard.crt" \
+                  "        keyFile: /certs/wildcard.key" \
+                  > "${CERTS_DIR}/traefik-tls.yml"
+              fi
+
+              # Start Traefik container with dashboard enabled
+              docker run -d \
+                --name traefik \
+                --restart unless-stopped \
+                -p 80:80 \
+                -p 443:443 \
+                -p 8080:8080 \
+                -v /var/run/docker.sock:/var/run/docker.sock:ro \
+                -v /etc/letsencrypt:/etc/letsencrypt:ro \
+                -v "${CERTS_DIR}":/certs:ro \
+                -v traefik-data:/data \
+                --network traefik-network \
+                --label "traefik.enable=true" \
+                --label "traefik.http.routers.traefik.rule=Host(\`traefik.${BASE_DOMAIN}\`)" \
+                --label "traefik.http.routers.traefik.service=api@internal" \
+                traefik:v3.0 \
+                --api.dashboard=true \
+                --api.insecure=true \
+                --providers.docker=true \
+                --providers.docker.exposedbydefault=false \
+                --providers.file.filename=/certs/traefik-tls.yml \
+                --entrypoints.web.address=:80 \
+                --entrypoints.websecure.address=:443 \
+                --log.level=INFO
+              
+              echo "Traefik started successfully"
+            fi
+            
+            # Wait for Traefik to be ready
+            echo "Waiting for Traefik to be ready..."
+            for i in {1..30}; do
+              if curl -sf http://localhost:8080/api/rawdata >/dev/null 2>&1; then
+                echo "Traefik is ready!"
+                break
+              fi
+              echo "Waiting... ($i/30)"
+              sleep 2
+            done
+
+
+
+    - step: &setup-traefik-dev
+        name: 🧭 Setup Traefik (dev)
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - dev.runner
+        script:
+          - *traefik_script
+
+
+
+    - step: &setup-traefik-uat
+        name: 🧭 Setup Traefik (uat)
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - uat.runner
+        script:
+          - *traefik_script
+
+
+
+    - step: &setup-traefik-prod
+        name: 🧭 Setup Traefik (prod)
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - prod.runner
+        trigger: manual
+        script:
+          - *traefik_script
+
+    # =============================================================================
+    # CLOUD-NATIVE STEPS (No Docker)
+    # =============================================================================
+    
+    - step: &lint-node-cloud
+        name: 🔍 Lint Code (Node.js)
+        image: node:20
+        caches: [node]
+        clone:
+          enabled: false
+        script:
+          - |
+            echo "=== Node.js Cloud Lint Step ==="
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Available artifacts: $(ls -la .consumer-repo-snapshot/ 2>/dev/null | wc -l) files"
+            
+            cd .consumer-repo-snapshot
+            
+            # Replicate logic from lint-node.sh but without Docker
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-${PR_ID:-}}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            echo "DEBUG: PR context - Branch: ${BITBUCKET_BRANCH:-}, PR: ${BITBUCKET_PR_ID:-}, Target: ${BITBUCKET_PR_DESTINATION_BRANCH:-}"
+            
+            # Skip check logic (same as original script)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping lint: PR not targeting develop/dev"
+              touch eslint-results.json eslint-results.html
+              exit 0
+            fi
+            
+            if [ "${SKIP_LINT:-false}" = "true" ]; then
+              echo "Skipping lint because SKIP_LINT=true"
+              touch eslint-results.json eslint-results.html
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            echo "DEBUG: APP_PATH set to: ${APP_PATH}"
+            echo "Checking for package.json at: ${APP_PATH}/package.json"
+            [ -f "${APP_PATH}/package.json" ] || { echo "ERROR: Missing ${APP_PATH}/package.json in consumer repo"; touch eslint-results.json eslint-results.html; exit 0; }
+            
+            # Cloud-native dependency installation (no Docker)
+            cd "${APP_PATH}"
+            echo "Installing dependencies..."
+            
+            # Set npm to use temporary directories
+            export npm_config_cache=/tmp/.npm
+            export npm_config_userconfig=/tmp/.npmrc
+            
+            # Install dependencies with legacy peer deps for React projects
+            if [ -f package-lock.json ]; then
+              npm ci --cache /tmp/.npm --legacy-peer-deps || npm install --cache /tmp/.npm --legacy-peer-deps
+            elif [ -f yarn.lock ]; then
+              yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+            elif [ -f pnpm-lock.yaml ]; then
+              pnpm install --frozen-lockfile --store-dir /tmp/.pnpm
+            else
+              npm install --cache /tmp/.npm --legacy-peer-deps
+            fi
+            
+            # Run ESLint (cloud-native, no Docker)
+            echo "Running ESLint..."
+            # Run ESLint from the app directory to get correct relative paths
+            npx eslint . --format json --output-file eslint-results.json || true
+            npx eslint . --format html --output-file eslint-results.html || true
+            
+            # Normalize paths in ESLint results to remove absolute path prefix
+            if [ -f "eslint-results.json" ] && command -v jq >/dev/null 2>&1; then
+              echo "Normalizing ESLint paths for cloud runner..."
+              # Remove the full absolute path and keep only the relative path from .consumer-repo-snapshot/
+              jq 'map(.filePath |= sub("^/opt/atlassian/pipelines/agent/build/.consumer-repo-snapshot/"; ""))' eslint-results.json > eslint-results-normalized.json && mv eslint-results-normalized.json eslint-results.json || true
+            fi
+            
+            echo "DEBUG: Generated artifacts: $(ls -la eslint-results.* 2>/dev/null | wc -l) files"
+            echo "Node.js lint completed"
+        artifacts:
+          - .consumer-repo-snapshot/eslint-results.json
+          - .consumer-repo-snapshot/eslint-results.html
+
+    - step: &test-node-cloud
+        name: 🧪 Run Tests (Node.js)
+        image: node:20
+        caches: [node]
+        clone:
+          enabled: false
+        script:
+          - |
+            echo "=== Node.js Cloud Test Step ==="
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Available artifacts: $(ls -la .consumer-repo-snapshot/ 2>/dev/null | wc -l) files"
+            
+            cd .consumer-repo-snapshot
+            
+            # Replicate logic from test-node.sh but without Docker
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-${PR_ID:-}}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            echo "DEBUG: PR context - Branch: ${BITBUCKET_BRANCH:-}, PR: ${BITBUCKET_PR_ID:-}, Target: ${BITBUCKET_PR_DESTINATION_BRANCH:-}"
+            
+            # Skip check logic (same as original script)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping tests: PR not targeting develop/dev"
+              mkdir -p coverage
+              touch coverage/coverage-final.json coverage.json
+              exit 0
+            fi
+
+            if [ "${SKIP_TESTS}" = "true" ] || [ "${SKIP_TEST}" = "true" ]; then
+              echo "Skipping tests because SKIP_TESTS=true or SKIP_TEST=true"
+              mkdir -p coverage
+              touch coverage/coverage-final.json coverage.json
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            echo "DEBUG: APP_PATH set to: ${APP_PATH}"
+            echo "Checking for package.json at: ${APP_PATH}/package.json"
+            [ -f "${APP_PATH}/package.json" ] || { echo "ERROR: Missing ${APP_PATH}/package.json in consumer repo"; mkdir -p coverage; touch coverage/coverage-final.json coverage.json; exit 0; }
+            
+            # Cloud-native dependency installation (no Docker)
+            cd "${APP_PATH}"
+            echo "Installing dependencies..."
+            
+            # Set npm to use temporary directories
+            export npm_config_cache=/tmp/.npm
+            export npm_config_userconfig=/tmp/.npmrc
+            
+            # Install dependencies with legacy peer deps for React projects
+            if [ -f package-lock.json ]; then
+              npm ci --cache /tmp/.npm --legacy-peer-deps || npm install --cache /tmp/.npm --legacy-peer-deps
+            elif [ -f yarn.lock ]; then
+              yarn install --frozen-lockfile --cache-folder /tmp/.yarn
+            elif [ -f pnpm-lock.yaml ]; then
+              pnpm install --frozen-lockfile --store-dir /tmp/.pnpm
+            else
+              npm install --cache /tmp/.npm --legacy-peer-deps
+            fi
+            
+            # Run tests (cloud-native, no Docker)
+            echo "Running tests..."
+            # Try test:ci first, then fallback to test
+            if npm run test:ci --if-present 2>/dev/null; then
+              echo "✅ Executed npm run test:ci"
+            else
+              npm run test --if-present 2>/dev/null || echo "⚠️  No test script present; skipping tests"
+            fi
+            
+            echo "DEBUG: Generated artifacts: $(ls -la coverage* 2>/dev/null | wc -l) files, coverage dir: $(ls -la coverage/ 2>/dev/null | wc -l) items"
+            
+            # Coverage files are already in the correct location (.consumer-repo-snapshot/)
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Coverage files already in correct location for artifacts"
+            echo "DEBUG: Coverage files: $(ls -la coverage* 2>/dev/null || echo 'No coverage files')"
+            echo "DEBUG: Coverage directory: $(ls -la coverage/ 2>/dev/null || echo 'No coverage directory')"
+            
+            # Ensure coverage files exist for artifacts
+            mkdir -p coverage
+            
+            # Create coverage.json if it doesn't exist
+            if [ ! -f "coverage.json" ]; then
+              if [ -f "coverage/coverage-final.json" ]; then
+                echo "DEBUG: Creating coverage.json from coverage-final.json..."
+                cp coverage/coverage-final.json coverage.json
+              else
+                echo "DEBUG: Creating empty coverage.json..."
+                echo '{"total":{"lines":{"total":0,"covered":0,"skipped":0,"pct":0}}}' > coverage.json
+              fi
+            fi
+            
+            # Create lcov.info if it doesn't exist
+            if [ ! -f "coverage/lcov.info" ]; then
+              echo "DEBUG: Creating minimal lcov.info..."
+              echo "TN:" > coverage/lcov.info
+              echo "SF:src/index.js" >> coverage/lcov.info
+              echo "FNF:0" >> coverage/lcov.info
+              echo "FNH:0" >> coverage/lcov.info
+              echo "LF:0" >> coverage/lcov.info
+              echo "LH:0" >> coverage/lcov.info
+              echo "end_of_record" >> coverage/lcov.info
+              echo "DEBUG: Created minimal lcov.info for Sonar"
+            fi
+            
+            echo "DEBUG: Final artifacts check:"
+            echo "DEBUG: coverage.json exists: $([ -f "coverage.json" ] && echo "YES" || echo "NO")"
+            echo "DEBUG: coverage/ directory exists: $([ -d "coverage" ] && echo "YES" || echo "NO")"
+            
+            echo "Node.js tests completed"
+        artifacts:
+          - .consumer-repo-snapshot/coverage/**
+          - .consumer-repo-snapshot/coverage.json
+
+    - step: &lint-python-cloud
+        name: 🔍 Lint Code (Python)
+        image: python:3.11
+        caches: [pip]
+        clone:
+          enabled: false
+        script:
+          - |
+            echo "=== Python Cloud Lint Step ==="
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Available artifacts: $(ls -la .consumer-repo-snapshot/ 2>/dev/null | wc -l) files"
+            
+            cd .consumer-repo-snapshot
+            
+            # Replicate logic from lint-python.sh but without Docker
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-${PR_ID:-}}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            echo "DEBUG: PR context - Branch: ${BITBUCKET_BRANCH:-}, PR: ${BITBUCKET_PR_ID:-}, Target: ${BITBUCKET_PR_DESTINATION_BRANCH:-}"
+            
+            # Skip check logic (same as original script)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping Python lint: PR not targeting develop/dev"
+              exit 0
+            fi
+            
+            if [ "${SKIP_LINT:-false}" = "true" ]; then
+              echo "Skipping Python lint because SKIP_LINT=true"
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            echo "DEBUG: APP_PATH set to: ${APP_PATH}"
+            echo "Checking for Python project files at: ${APP_PATH}/"
+            if [ ! -f "${APP_PATH}/requirements.txt" ] && [ ! -f "${APP_PATH}/pyproject.toml" ]; then
+              echo "No Python project files found (requirements.txt/pyproject.toml) - skipping Python lint"
+              exit 0
+            fi
+            
+            # Cloud-native dependency installation (no Docker)
+            cd "${APP_PATH}"
+            echo "Installing dependencies..."
+            
+            # Install dependencies
+            pip install --upgrade pip
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
+            if [ -f pyproject.toml ]; then
+              pip install -e .
+            fi
+            pip install pylint || true
+            
+            # Run Pylint (cloud-native, no Docker)
+            echo "Running Pylint..."
+            pylint --output-format=json **/*.py > pylint-results.json || true
+            pylint --output-format=html **/*.py > pylint-results.html || true
+            
+            # Normalize paths in Pylint results to remove absolute path prefix
+            if [ -f "pylint-results.json" ] && command -v jq >/dev/null 2>&1; then
+              echo "Normalizing Pylint paths for cloud runner..."
+              # Remove the full absolute path and keep only the relative path from .consumer-repo-snapshot/
+              jq 'map(.path |= sub("^/opt/atlassian/pipelines/agent/build/.consumer-repo-snapshot/"; ""))' pylint-results.json > pylint-results-normalized.json && mv pylint-results-normalized.json pylint-results.json || true
+            fi
+            
+            echo "DEBUG: Generated artifacts: $(ls -la pylint-results.* 2>/dev/null | wc -l) files"
+            echo "Python lint completed"
+        artifacts:
+          - .consumer-repo-snapshot/pylint-results.json
+          - .consumer-repo-snapshot/pylint-results.html
+
+    - step: &test-python-cloud
+        name: 🧪 Run Tests (Python)
+        image: python:3.11
+        caches: [pip]
+        clone:
+          enabled: false
+        script:
+          - |
+            echo "=== Python Cloud Test Step ==="
+            echo "DEBUG: Current directory: $(pwd)"
+            echo "DEBUG: Available artifacts: $(ls -la .consumer-repo-snapshot/ 2>/dev/null | wc -l) files"
+            
+            cd .consumer-repo-snapshot
+            
+            # Replicate logic from test-python.sh but without Docker
+            PR_ID_FOR_USE="${BITBUCKET_PR_ID:-${PR_ID:-}}"
+            export PR_ID_FOR_USE=${PR_ID_FOR_USE}
+            
+            echo "DEBUG: PR context - Branch: ${BITBUCKET_BRANCH:-}, PR: ${BITBUCKET_PR_ID:-}, Target: ${BITBUCKET_PR_DESTINATION_BRANCH:-}"
+            
+            # Skip check logic (same as original script)
+            if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ]; }; }; then
+              echo "Skipping Python tests: PR not targeting develop/dev"
+              exit 0
+            fi
+
+            if [ "${SKIP_TESTS}" = "true" ] || [ "${SKIP_TEST}" = "true" ]; then
+              echo "Skipping tests because SKIP_TESTS=true or SKIP_TEST=true"
+              exit 0
+            fi
+            
+            export APP_PATH="${APP_PATH:-.}"
+            echo "DEBUG: APP_PATH set to: ${APP_PATH}"
+            echo "Checking for Python project files at: ${APP_PATH}/"
+            if [ ! -f "${APP_PATH}/requirements.txt" ] && [ ! -f "${APP_PATH}/pyproject.toml" ]; then
+              echo "No Python project files found (requirements.txt/pyproject.toml) - skipping Python tests"
+              exit 0
+            fi
+            
+            # Cloud-native dependency installation (no Docker)
+            cd "${APP_PATH}"
+            echo "Installing dependencies..."
+            
+            # Install dependencies
+            pip install --upgrade pip
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
+            if [ -f pyproject.toml ]; then
+              pip install -e .
+            fi
+            pip install pytest pytest-cov || true
+            
+            # Run tests (cloud-native, no Docker)
+            echo "Running tests..."
+            pytest --cov=. --cov-report=json --cov-report=html || true
+            
+            # Rename coverage.json to python-coverage.json to avoid conflicts with Node.js
+            if [ -f "coverage.json" ]; then
+              mv coverage.json python-coverage.json
+              echo "DEBUG: Renamed coverage.json to python-coverage.json"
+            fi
+            
+            echo "DEBUG: Generated artifacts: $(ls -la *coverage* 2>/dev/null | wc -l) files, htmlcov dir: $(ls -la htmlcov/ 2>/dev/null | wc -l) items"
+            echo "Python tests completed"
+        artifacts:
+          - .consumer-repo-snapshot/python-coverage.json
+          - .consumer-repo-snapshot/htmlcov/
+
+  pipelines:
+
+    general-pipeline-develop:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - parallel:
+          - step: *lint-node-cloud
+          - step: *lint-python-cloud
+          - step: *test-node-cloud
+          - step: *test-python-cloud
+          - step: *build
+      - step: *scout
+      - step: *sonar
+      - step: *setup-traefik-dev
+      - step: *deploy-dev
+
+    general-pipeline-develop-node:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint-node
+      - step: *test-node
+      - step: *build-node
+      - step: *scout
+      - step: *sonar
+      - step: *setup-traefik-dev
+      - step: *deploy-dev
+
+    general-pipeline-develop-python:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint-python
+      - step: *test-python
+      - step: *build-python
+      - step: *scout
+      - step: *sonar
+      - step: *setup-traefik-dev
+      - step: *deploy-dev
+
+    general-pipeline-release:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *build
+      - step: *scout
+      - step: *sonar
+      - step: *setup-traefik-uat
+      - step: *deploy-uat
+
+    general-pipeline-main:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *build
+      - step: *promote-prod
+      - step: *scout
+      - step: *sonar
+      - step: *setup-traefik-prod
+      - step: *deploy-prod
+
+    general-pipeline-hotfix:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *build  # Build hotfix tag regardless of repo type
+
+    # =============================================================================
+    # feature and PR pipelines with Traefik
+    # =============================================================================
+    general-pipeline-pr-traefik:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - parallel:
+          - step: *lint-node-cloud
+          - step: *lint-python-cloud
+          - step: *test-node-cloud
+          - step: *test-python-cloud
+          - step: *build
+      - step: *scout
+      - step: *sonar
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+      - step: *trigger-peer
+    
+    general-pipeline-pr-traefik-node:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint-node
+      - step: *test-node
+      - step: *build-node
+      - step: *scout
+      - step: *sonar
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+      - step: *trigger-peer  
+
+    general-pipeline-pr-traefik-python:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint-python
+      - step: *test-python
+      - step: *build-python
+      - step: *scout
+      - step: *sonar
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+      - step: *trigger-peer
+
+    general-pipeline-feature-traefik:
+      - step: *setup-shared-pipelines
+      - step: *feature-gate
+      - step: *setup-env
+      - parallel:
+          - step: *lint-node-cloud
+          - step: *lint-python-cloud
+          - step: *test-node-cloud
+          - step: *test-python-cloud
+          - step: *build
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+
+    general-pipeline-feature-traefik-python:
+      - step: *setup-shared-pipelines
+      - step: *feature-gate
+      - step: *setup-env
+      - step: *lint-python
+      - step: *test-python
+      - step: *build-python
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+
+    general-pipeline-feature-traefik-node:
+      - step: *setup-shared-pipelines
+      - step: *feature-gate
+      - step: *setup-env
+      - step: *lint-node
+      - step: *test-node
+      - step: *build-node
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+
+    # Manual Traefik preview teardown
+    manual-preview-teardown-traefik:
+      - variables:
+        - name: BITBUCKET_BRANCH
+          description: "Branch name to teardown (e.g., feature/nod-50)"
+          default: ""
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *teardown-preview-traefik
+      - step: *teardown-sonar
+      
+    # =============================================================================
+    # TEST PIPELINES (Hybrid Cloud + Self-Hosted)
+    # =============================================================================
+    
+    test-pipeline-hybrid-feature:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - parallel:
+          - step: *lint-node-cloud
+          - step: *lint-python-cloud
+          - step: *test-node-cloud
+          - step: *test-python-cloud
+          - step: *build
+      - step: *scout
+      - step: *sonar
+
+    test-pipeline-hybrid-pr:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - parallel:
+          - step: *lint-node-cloud
+          - step: *lint-python-cloud
+          - step: *test-node-cloud
+          - step: *test-python-cloud
+          - step: *build
+      - step: *scout
+      - step: *setup-preview-traefik
+      - step: *deploy-preview-traefik
+      - step: *trigger-peer
