@@ -4,6 +4,179 @@ A comprehensive CI/CD pipeline library for Bitbucket Pipelines with support for 
 
 📖 **[Production Deployment Checklist](PRODUCTION-CHECKLIST.md)** - Complete guide for deploying to UAT/Prod with different repository types.
 
+## 📌 Assumptions & Architecture
+
+This pipeline library is designed with specific assumptions about your infrastructure and deployment environment:
+
+### 🏗️ Deployment Architecture
+
+- **VM-Based Deployments**: Designed to run on virtual machines (VMs) using Docker Compose
+  - **Not Kubernetes**: This pipeline targets container deployments that don't require orchestration complexity
+  - **Docker Compose**: Uses docker-compose for multi-container applications
+  - **Direct Container Deployment**: Containers deploy directly on VMs without container orchestration
+
+### 🌐 DNS & Network Infrastructure
+
+- **Internal DNS (BIND Server)**: Used for dev/UAT environments and admin panels
+  - Requires internal BIND DNS server with TSIG keys
+  - Private/internal access for non-production environments
+  
+- **Public DNS (Cloudflare)**: Used for production frontends
+  - Cloudflare DNS for public-facing applications
+  - Cloudflare Tunnel for backends without public IPs
+  - Cloudflare Workers for webhook integration
+
+### 🔧 CI/CD Platform
+
+- **Bitbucket Pipelines**: Primary CI/CD platform
+  - **Self-Hosted Runners**: Heavy reliance on self-hosted runners for:
+    - Fast CI execution
+    - Parallel pipeline steps
+    - Docker socket access
+    - Access to internal infrastructure
+  
+  - **Cloud Runners**: Used as fallback for lightweight CI tasks (lint, test)
+  - **Bitbucket API**: Uses Bitbucket API for deployment variables and webhook integration
+
+### 🐳 Container & Registry
+
+- **Docker**: Container platform
+  - Multi-stage builds
+  - Docker Scout for vulnerability scanning
+  - Docker Compose for orchestration
+  
+- **Docker Hub**: Primary container registry
+  - Image storage and distribution
+  - Tag-based promotion workflow
+
+### 🔍 Quality & Security Tools
+
+- **SonarQube**: Code quality analysis
+  - Centralized SonarQube instance
+  - Integration with Docker Scout vulnerabilities
+  
+- **Docker Scout**: Container vulnerability scanning
+  - SARIF reporting
+  - Integration with SonarQube
+
+### 🔐 Reverse Proxy & SSL
+
+- **Traefik**: Reverse proxy and load balancer
+  - Automatic TLS certificate management
+  - Let's Encrypt integration
+  - Cloudflare DNS challenge for wildcard certificates
+
+### 💻 Supported Runtimes
+
+- **Node.js**: JavaScript/TypeScript applications
+  - npm, yarn, pnpm package managers
+  - ESLint for linting
+  - Jest for testing
+  
+- **Python**: Python applications
+  - pip, poetry, pipenv support
+  - Ruff/Flake8 for linting
+  - pytest for testing
+
+### ⚡ CI vs CD Separation
+
+- **CI Components**: Can be used standalone without CD
+  - Lint, test, build, scan stages work independently
+  - No dependency on deployment infrastructure for CI
+  
+- **CD Components**: Require specific infrastructure
+  - Deployment targets (VMs)
+  - DNS servers (BIND or Cloudflare)
+  - Traefik for routing
+  - Docker daemon access
+
+### 🔌 External Dependencies
+
+- **Cloudflare**: Multiple services
+  - DNS management for production
+  - Tunnel service for backend services
+  - Workers for webhook handling
+  
+- **Let's Encrypt**: SSL certificate authority
+  - Automatic certificate provisioning
+  - Wildcard certificates via DNS challenge
+
+## 📑 Table of Contents
+
+- [📑 Table of Contents](#table-of-contents)
+- [📌 Assumptions & Architecture](#-assumptions--architecture)
+- [🚀 Quick Start](#-quick-start)
+  - [1. Enable Shared Pipelines in Your Repo](#enable-shared-pipelines-in-your-repo)
+  - [2. Understanding YAML Imports](#understanding-yaml-imports)
+  - [3. Set Up Required Variables](#set-up-required-variables)
+  - [4. Create Self-Hosted Runners](#create-self-hosted-runners)
+  - [5. Set Up Deployment Environments](#set-up-deployment-environments)
+- [📋 Features](#features)
+  - [✅ Supported Technologies](#supported-technologies)
+  - [✅ Environments](#environments)
+  - [✅ Pipeline Stages](#pipeline-stages)
+  - [🔔 PR-Merged → Auto Teardown (Cloudflare Worker)](#pr-merged-auto-teardown-cloudflare-worker)
+- [🏗️ Architecture](#architecture)
+  - [A Typical Pipeline Flow (e.g. Preview Env)](#a-typical-pipeline-flow-eg-preview-env)
+  - [Environment Routing](#environment-routing)
+  - [🎯 Decision Matrix by Environment](#decision-matrix-by-environment)
+- [🐳 Docker Compose Support](#docker-compose-support)
+  - [File Structure](#file-structure)
+  - [How It Works](#how-it-works)
+  - [Environment-Scoped Build Arguments (static builds)](#environment-scoped-build-arguments-static-builds)
+- [🔧 Configuration](#configuration)
+  - [Package.json Scripts (Node.js)](#packagejson-scripts-nodejs)
+  - [Python Requirements](#python-requirements)
+  - [Dockerfile Best Practices](#dockerfile-best-practices)
+  - [Environment-Scoped Build Arguments (static builds)](#environment-scoped-build-arguments-static-builds)
+- [🌐 Traefik Integration](#traefik-integration)
+  - [Automatic TLS](#automatic-tls)
+  - [Dashboard Access](#dashboard-access)
+  - [Preview Environments](#preview-environments)
+  - [Dev/UAT/Prod Routing](#devuatprod-routing)
+- [🔐 Cloudflare Tunnel (Backend without Public IP)](#cloudflare-tunnel-backend-without-public-ip)
+  - [Why Use Cloudflare Tunnel?](#why-use-cloudflare-tunnel)
+  - [Setup](#setup)
+  - [Backend Docker Compose Requirements](#backend-docker-compose-requirements)
+  - [How It Works](#how-it-works)
+  - [Frontend Integration](#frontend-integration)
+  - [Troubleshooting](#troubleshooting)
+- [🔄 Cross-Repository Previews](#cross-repository-previews)
+  - [Setup](#setup)
+  - [Behavior](#behavior)
+  - [Feature Gate](#feature-gate)
+  - [Peer Host URLs Format](#peer-host-urls-format)
+  - [Trigger Loop Prevention](#trigger-loop-prevention)
+- [🔥 Hotfix Flow](#hotfix-flow)
+  - [Workflow](#workflow)
+  - [Tags](#tags)
+- [🚫 Stage Bypass Flags](#stage-bypass-flags)
+- [🏷️ Repository Type Flags](#repository-type-flags)
+  - [Behavior:](#behavior)
+- [🔒 Admin Panel Security](#admin-panel-security)
+  - [**IP Whitelist Ranges:**](#ip-whitelist-ranges)
+  - [**How It Works:**](#how-it-works)
+  - [**Security Model:**](#security-model)
+- [📊 Quality Gates](#quality-gates)
+  - [SonarQube Integration](#sonarqube-integration)
+  - [Docker Scout](#docker-scout)
+- [🛠️ Troubleshooting](#troubleshooting)
+  - [Common Issues](#common-issues)
+  - [Debug Commands](#debug-commands)
+- [🔍 Verifying Docker Scout Integration in SonarQube](#verifying-docker-scout-integration-in-sonarqube)
+  - [How to Check Docker Scout Results in SonarQube:](#how-to-check-docker-scout-results-in-sonarqube)
+  - [What You Should See:](#what-you-should-see)
+  - [Pipeline Logs to Check:](#pipeline-logs-to-check)
+  - [Troubleshooting Docker Scout Integration:](#troubleshooting-docker-scout-integration)
+- [📚 Examples](#examples)
+  - [Example 1: Backend API (with auto-detection)](#example-1-backend-api-with-auto-detection)
+  - [Example 2: Frontend App (with auto-detection)](#example-2-frontend-app-with-auto-detection)
+  - [Example 3: Admin Panel](#example-3-admin-panel)
+  - [Example 4: Hotfix Deployment](#example-4-hotfix-deployment)
+- [🤝 Contributing](#contributing)
+- [📄 License](#license)
+- [🆘 Support](#support)
+
 ## 🚀 Quick Start
 
 ### 1. Enable Shared Pipelines in Your Repo
@@ -275,23 +448,245 @@ Notes:
 
 ## 🏗️ Architecture
 
-### A Typical Pipeline Flow (e.g. Preview Env)
+### Complete Pipeline Flow
+
+#### Stage 1: Quality Assurance (Parallel Execution)
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│    Lint     │ -> │    Test     │ -> │    Build    │ -> │ DockerHub   │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
-                                                                |
-                                                                V
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│   Deploy    │ <- │   Traefik   │ <- │   SonarQube │ <- │    Docker   │
-│    Env      │    │    Setup    │    │ QualityGate │    │    Scout    │
-└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Code Push/PR                              │
+└────────────────────────────┬─────────────────────────────────────┘
+                             │
+                             ▼
+                ┌────────────────────────┐
+                │  Setup Shared Pipelines│
+                └────────────┬───────────┘
+                             │
+                ┌────────────┴────────────┐
+                │                         │
+                ▼                         ▼
+        ┌──────────────┐         ┌──────────────┐
+        │  Auto-Detect │         │  Auto-Detect │
+        │   Project    │         │   Project    │
+        │     Type     │         │     Type     │
+        └──────┬───────┘         └──────┬───────┘
+               │                        │
+               ▼                        ▼
+┌──────────────────────────┐  ┌──────────────────────────┐
+│  Node.js (package.json)  │  │  Python (pyproject.toml) │
+└──────────────────────────┘  └──────────────────────────┘
 ```
 
-### Environment Routing
-- **Dev/UAT/Prod**: Traefik + Let's Encrypt certificates
-- **Preview**: Traefik + dynamic routing per PR
-- **DNS**: Cloudflare (public) + BIND (internal)
+#### Stage 2: CI Pipeline (Quality Gates)
+```
+                    ┌────────────────────┐
+                    │   Shared Setup     │
+                    │  (Clone & Env)     │
+                    └──────────┬─────────┘
+                               │
+                    ┌──────────┴──────────┐
+                    │                     │
+                    ▼                     ▼
+        ┌──────────────────┐   ┌──────────────────┐
+        │   Lint Stage     │   │   Lint Stage     │
+        │  (ESLint/Node)   │   │  (Ruff/Python)   │
+        └────────┬─────────┘   └────────┬─────────┘
+                 │                     │
+                 └──────────┬──────────┘
+                            │
+                    ┌───────┴────────┐
+                    │                │
+                    ▼                ▼
+        ┌──────────────────┐   ┌──────────────────-┐
+        │   Test Stage     │   │    Test Stage     │
+        │  (Jest+Coverage) │   │ (pytest+Coverage) │
+        └────────┬─────────┘   └────────┬─────────-┘
+                 │                     │
+                 └──────────┬──────────┘
+                            │
+                    ┌───────┴────────┐
+                    │                │
+                    ▼                ▼
+        ┌──────────────────┐   ┌──────────────────┐
+        │  Build Stage     │   │  Build Stage     │
+        │ (Docker Node)    │   │(Docker Python)   │
+        └────────┬─────────┘   └────────┬─────────┘
+                 │                     │
+                 └──────────┬──────────┘
+                            │
+                            ▼
+        ┌───────────────────────────────────┐
+        │         Build Stage               │
+        │     (Image Tag & Push)            │
+        └───────────────┬───────────────────┘
+                        │
+                        ▼
+        ┌───────────────────────────────────┐
+        │        Scan Stage                 │
+        │  (Docker Scout + SonarQube)       │
+        │  ↘ Quality Gate Check → Continue  │
+        └───────────────┬───────────────────┘
+                        │
+                ┌───────┴───────┐
+                │               │
+                ▼               ▼
+       ┌───────────┐   ┌───────────┐
+       │  Backend  │   │  Frontend │
+       │  Promote  │   │  Rebuild  │
+       └───────────┘   └───────────┘
+```
+
+#### Stage 3: Deployment Flow (Environment-Specific)
+```
+Backend Flow (Promote):
+┌─────────┐   Promote   ┌─────────┐   Promote   ┌─────────┐
+│   Dev   │────────────>│   UAT   │────────────>│  Prod   │
+│ Tagged  │   Retag     │ Tagged  │   Retag     │ + Latest│
+└─────────┘             └─────────┘             └─────────┘
+
+Frontend Flow (Rebuild):
+┌─────────┐   Build     ┌─────────┐   Build     ┌─────────┐
+│   Dev   │────────────>│   UAT   │────────────>│  Prod   │
+│ Config  │             │ Config  │             │ + Latest│
+└─────────┘             └─────────┘             └─────────┘
+```
+
+#### Complete Deployment Architecture
+```
+┌────────────────────────────────────────────────────────────┐
+│                        Bitbucket                           │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  Consumer Repository → bitbucket-pipelines.yml       │  │
+│  │  Import: shared-pipelines:main:general-pipeline-*    │  │
+│  └────────────────┬─────────────────────────────────────┘  │
+└───────────────────┼────────────────────────────────────────┘
+                    │
+                    ▼
+┌────────────────────────────────────────────────────────────┐
+│              Shared Pipelines (This Repo)                  │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │  bitbucket-pipelines.yml (3867 lines)                │  │
+│  │  ├── Setup & Clone Steps                             │  │
+│  │  ├── Lint Steps (Cloud + Self-Hosted)                │  │
+│  │  ├── Test Steps (Cloud + Self-Hosted)                │  │
+│  │  ├── Build Steps                                     │  │
+│  │  ├── Scan Steps (Docker Scout)                       │  │
+│  │  ├── Quality Gate (SonarQube)                        │  │
+│  │  ├── Deploy Steps                                    │  │
+│  │  └── Teardown (Preview only - PR merged)             │  │
+│  └───────────────────┬──────────────────────────────────┘  │
+└──────────────────────┼─────────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│   DockerHub  │ │  SonarQube   │ │   Traefik    │
+│  Registry    │ │  Analysis    │ │   Reverse    │
+│              │ │              │ │   Proxy      │
+└──────┬───────┘ └──────────────┘ └──────┬───────┘
+       │                                 │
+       ▼                                 ▼
+┌──────────────────────────────────────────────┐
+│           Deployment Infrastructure          │
+│                                              │
+│    ┌────────┐  ┌────────┐  ┌────────┐        │
+│    │  Dev   │  │  UAT   │  │  Prod  │        │
+│    │  VM    │  │  VM    │  │  VM    │        │
+│    └───┬────┘  └───┬────┘  └───┬────┘        │
+│        │           │           │             │
+│        └───────────┴───────────┘             │
+│                    │                         │
+│                    ▼                         │
+│            ┌─────────────────┐               │
+│            │  Docker Compose │               │
+│            │   Containers    │               │
+│            └─────────────────┘               │
+└──────────────────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        │              │              │
+        ▼              ▼              ▼
+┌──────────────┐ ┌──────────────┐ ┌──────────────┐
+│  BIND DNS    │ │ Cloudflare   │ │   Users      │
+│  (Internal)  │ │ (Public)     │ │  Access      │
+└──────────────┘ └──────────────┘ └──────────────┘
+```
+
+### Runner Allocation Strategy
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Pipeline Trigger                           │
+│      (Branch Push, PR, Manual, Scheduled)                   │
+└───────────────────┬─────────────────────────────────────────┘
+                    │
+        ┌───────────┴───────────┐
+        │                       │
+        ▼                       ▼
+┌───────────────┐     ┌───────────────────┐
+│ Cloud Runners │     │ Self-Hosted       │
+│ (Atlassian)   │     │ Runners (Custom)  │
+├───────────────┤     ├───────────────────┤
+│ • Fast setup  │     │ • Docker socket   │
+│ • No cache    │     │ • Persistent cache│
+│ • Limited     │     │ • Internal access │
+│   resources   │     │ • Fast execution  │
+│               │     │ • Parallel stages │
+│ Tasks:        │     │                   │
+│ • Lint        │     │ Tasks:            │
+│ • Test        │     │ • Build           │
+│ (Optional)    │     │ • Deploy          │
+└───────────────┘     │ • SSL setup       │
+                      │ • DNS updates     │
+                      └───────────────────┘
+```
+
+### Environment Routing Architecture
+```
+User Request Flow by Environment:
+
+Production (Public):
+Backend (Cloudflare Tunnel):
+┌─────────┐     DNS   ┌──────────────┐    Cloudflare  ┌─────────────┐
+│  User   │──────────>│ Cloudflare   │    Tunnel      │  Backend    │
+│ Browser │           │   Edge       │───────────────>│  Container  │
+└─────────┘           └──────────────┘                └─────────────┘
+
+Frontend (Traefik):
+┌─────────┐     DNS   ┌──────────────┐    Traefik     ┌─────────────┐
+│  User   │──────────>│ Cloudflare   │    Reverse     │  Frontend   │
+│ Browser │           │   Edge       │───────────────>│  Container  │
+└─────────┘           └──────────────┘   Proxy (443)  └─────────────┘
+                             │
+                             ▼
+                    ┌─────────────────┐
+                    │  Cloudflare DNS │
+                    │  (proxied=true) │
+                    └─────────────────┘
+
+Dev/UAT (Internal):
+Backend & Frontend (Both via Traefik):
+┌─────────┐     Internal  ┌──────────────┐  Traefik   ┌──────────┐
+│Internal │     DNS (BIND)│  Traefik     │  Routing   │Container │
+│  User   │──────────────>│   Proxy      │───────────>│          │
+└─────────┘               └──────────────┘            └──────────┘
+                             │
+                             ▼
+                    ┌────────────────────┐
+                    │ Let's Encrypt Cert │
+                    │  (Wildcard *.dev)  │
+                    └────────────────────┘
+
+Preview (PR-based):
+Backend & Frontend (Both via Traefik):
+┌─────────┐   Dynamic DNS   ┌──────────────┐  Traefik  ┌──────────┐
+│Developer│────────────────>│   Traefik    │  Routing  │Preview   │
+│  via    │  preview-123    │   Proxy      │──────────>│Container │
+│  URL    │  internal.xyz   └──────────────┘           └──────────┘
+└─────────┘                                             
+                 ┌─────────────────────────────────┐
+                 │ PR-specific domain & isolation  │
+                 └─────────────────────────────────┘
+```
 
 ### 🎯 Decision Matrix by Environment
 
