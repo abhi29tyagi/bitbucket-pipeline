@@ -112,7 +112,8 @@ docker run --rm \
   --email "$EMAIL" \
   --dns-cloudflare --dns-cloudflare-credentials /cloudflare/credentials.ini \
   -d "*.${FQDN}" -d "${FQDN}" \
-  --cert-name "$CERT_NAME" || {
+  --cert-name "$CERT_NAME" \
+  --disable-hook-validation || {
     echo "ERROR: certbot failed"
     exit 1
   }

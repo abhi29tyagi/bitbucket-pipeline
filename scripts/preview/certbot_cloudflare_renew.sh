@@ -46,7 +46,16 @@ fi
 export DOCKER_HOST="unix:///var/run/docker.sock"
 
 LETSENCRYPT_DIR="/etc/letsencrypt"
+# Default to same location as issuance script creates credentials
+CLOUDFLARE_DIR="${CLOUDFLARE_DIR:-/etc/letsencrypt/cloudflare}"
+CLOUDFLARE_CREDS="${CLOUDFLARE_CREDENTIALS:-$CLOUDFLARE_DIR/credentials.ini}"
 CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
+
+if [ ! -f "$CLOUDFLARE_CREDS" ]; then
+  echo "ERROR: Cloudflare credentials file not found at $CLOUDFLARE_CREDS"
+  echo "Create it with 'dns_cloudflare_api_token = <token>' (chmod 600) before running renewals."
+  exit 1
+fi
 
 # Pre-pull image to ensure it's available
 docker pull "$CERTBOT_IMAGE" >/dev/null 2>&1 || true
@@ -54,6 +63,7 @@ docker pull "$CERTBOT_IMAGE" >/dev/null 2>&1 || true
 # Renew (non-interactive). certbot returns 0 even if nothing renewed.
 docker run --rm \
   -v "$LETSENCRYPT_DIR:/etc/letsencrypt" \
+  -v "$CLOUDFLARE_DIR:/cloudflare" \
   $CERTBOT_IMAGE renew --non-interactive || {
     echo "ERROR: certbot renew failed"
     exit 1

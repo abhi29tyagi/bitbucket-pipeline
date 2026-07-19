@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Script to import Docker Scout SARIF results to SonarQube
-# This script handles the integration between Docker Scout and SonarQube
+# Script to convert Docker Scout SARIF results to SonarQube Generic External Issues format
+# Used in the CI stage to import Docker Scout security findings
 
 set -e
 

@@ -15,7 +15,7 @@ export PR_ID_FOR_USE=${PR_ID_FOR_USE}
 # Only run for PRs targeting important branches OR direct branch runs
 # Direct branch runs: dev/develop/release/*/main/hotfix/* → always run (no BITBUCKET_PR_ID)
 # PR runs: Only if targeting develop/dev/main/release/* → run; otherwise skip (hotfix has no PRs)
-if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && [ "${FORCE_BUILD}" != "true" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "main" ] && [[ ! "${BITBUCKET_PR_DESTINATION_BRANCH:-}" =~ ^release/ ]]; }; }; then
+if [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "${BITBUCKET_PR_ID:-}" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "dev" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH:-}" != "main" ] && [[ ! "${BITBUCKET_PR_DESTINATION_BRANCH:-}" =~ ^release/ ]]; }; }; then
   echo "Skipping: PR not targeting dev/develop/main/release/*"
   exit 0
 fi
@@ -37,6 +37,18 @@ DOCKERFILE_PATH="${DOCKERFILE_PATH:-$APP_PATH_DIR/Dockerfile}"
 BUILD_CONTEXT="${BUILD_CONTEXT:-$APP_PATH_DIR}"
 
 [ -f "$DOCKERFILE_PATH" ] || { echo "ERROR: Dockerfile not found at $DOCKERFILE_PATH"; exit 1; }
+
+# Run pre-build command if provided (e.g., for monorepo shared directories)
+# NOTE: Docker's build context does NOT follow symlinks outside the build context.
+# Use 'cp -r' to copy directories instead of 'ln -s' for symlinks.
+# Example: cp -r /path/to/shared ./shared && rm -rf ./shared/node_modules ./shared/.git
+if [ -n "${PRE_BUILD_COMMAND:-}" ]; then
+  echo "Running pre-build command: $PRE_BUILD_COMMAND"
+  eval "$PRE_BUILD_COMMAND" || {
+    echo "ERROR: Pre-build command failed"
+    exit 1
+  }
+fi
 
 echo "Building Docker image from $DOCKERFILE_PATH with context $BUILD_CONTEXT..."
 docker build -f "$DOCKERFILE_PATH" "$BUILD_CONTEXT" \
@@ -64,6 +76,46 @@ else
   echo "Skipping dev tag push (not on develop/dev branch)"
 fi
 
+# Tag and push UAT image for release/* branches
+if [[ "$BITBUCKET_BRANCH" =~ ^release/ ]]; then
+  # Use UAT_TAG from setup-env if available, otherwise calculate
+  if [ -z "${UAT_TAG:-}" ]; then
+    RELEASE_TAG="release-$(echo $BITBUCKET_BRANCH | sed 's/release\///')"
+    UAT_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$RELEASE_TAG"
+    echo "Calculated UAT_TAG: $UAT_TAG"
+  else
+    echo "Using UAT_TAG from setup-env: $UAT_TAG"
+  fi
+  docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$UAT_TAG"
+  export UAT_TAG
+  TAGS_TO_PUSH+=("$UAT_TAG")
+  echo "Tagged UAT image: $UAT_TAG"
+fi
+
+# Tag and push prod image for main branch
+if [ "$BITBUCKET_BRANCH" = "main" ]; then
+  # Use PROD_TAG from setup-env if available, otherwise calculate
+  if [ -z "${PROD_TAG:-}" ]; then
+    VERSION="${VERSION:-}"
+    if [ -z "$VERSION" ] && [ -n "${BITBUCKET_TAG:-}" ]; then
+      VERSION="$(echo "$BITBUCKET_TAG" | sed -E 's/^(v|release-)//')"
+    fi
+    if [ -z "$VERSION" ]; then
+      SHORT_COMMIT="${BITBUCKET_COMMIT:0:8}"
+      VERSION="prod-$SHORT_COMMIT"
+      echo "Calculated VERSION for main: $VERSION"
+    fi
+    PROD_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$VERSION"
+    echo "Calculated PROD_TAG: $PROD_TAG"
+  else
+    echo "Using PROD_TAG from setup-env: $PROD_TAG"
+  fi
+  docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$PROD_TAG"
+  export PROD_TAG
+  TAGS_TO_PUSH+=("$PROD_TAG")
+  echo "Tagged prod image: $PROD_TAG"
+fi
+
 # Tag and push hotfix image for hotfix/* branches  
 if [[ "$BITBUCKET_BRANCH" =~ ^hotfix/ ]]; then
   # Use HOTFIX_TAG from setup-env if available, otherwise calculate
@@ -79,9 +131,8 @@ if [[ "$BITBUCKET_BRANCH" =~ ^hotfix/ ]]; then
   TAGS_TO_PUSH+=("$HOTFIX_TAG")
   echo "Tagged hotfix image: $HOTFIX_TAG"
 fi
-
-# Tag and push feature/branch or PR image via TAG_SLUG (only for non-main/hotfix branches)
-if [ -n "$TAG_SLUG" ] && [ "${BITBUCKET_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_BRANCH:-}" != "dev" ] && [[ ! "$BITBUCKET_BRANCH" =~ ^hotfix/ ]]; then
+# Tag and push feature/branch or PR image via TAG_SLUG (only for non-main/release/hotfix branches)
+if [ -n "$TAG_SLUG" ] && [ "${BITBUCKET_BRANCH:-}" != "develop" ] && [ "${BITBUCKET_BRANCH:-}" != "dev" ] && [ "${BITBUCKET_BRANCH:-}" != "main" ] && [[ ! "$BITBUCKET_BRANCH" =~ ^release/ ]] && [[ ! "$BITBUCKET_BRANCH" =~ ^hotfix/ ]]; then
   BR_TAG="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$TAG_SLUG"
   docker tag "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" "$BR_TAG"
   TAGS_TO_PUSH+=("$BR_TAG")

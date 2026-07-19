@@ -4,179 +4,6 @@ A comprehensive CI/CD pipeline library for Bitbucket Pipelines with support for 
 
 📖 **[Production Deployment Checklist](PRODUCTION-CHECKLIST.md)** - Complete guide for deploying to UAT/Prod with different repository types.
 
-## 📌 Assumptions & Architecture
-
-This pipeline library is designed with specific assumptions about your infrastructure and deployment environment:
-
-### 🏗️ Deployment Architecture
-
-- **VM-Based Deployments**: Designed to run on virtual machines (VMs) using Docker Compose
-  - **Not Kubernetes**: This pipeline targets container deployments that don't require orchestration complexity
-  - **Docker Compose**: Uses docker-compose for multi-container applications
-  - **Direct Container Deployment**: Containers deploy directly on VMs without container orchestration
-
-### 🌐 DNS & Network Infrastructure
-
-- **Internal DNS (BIND Server)**: Used for dev/UAT environments and admin panels
-  - Requires internal BIND DNS server with TSIG keys
-  - Private/internal access for non-production environments
-  
-- **Public DNS (Cloudflare)**: Used for production frontends
-  - Cloudflare DNS for public-facing applications
-  - Cloudflare Tunnel for backends without public IPs
-  - Cloudflare Workers for webhook integration
-
-### 🔧 CI/CD Platform
-
-- **Bitbucket Pipelines**: Primary CI/CD platform
-  - **Self-Hosted Runners**: Heavy reliance on self-hosted runners for:
-    - Fast CI execution
-    - Parallel pipeline steps
-    - Docker socket access
-    - Access to internal infrastructure
-  
-  - **Cloud Runners**: Used as fallback for lightweight CI tasks (lint, test)
-  - **Bitbucket API**: Uses Bitbucket API for deployment variables and webhook integration
-
-### 🐳 Container & Registry
-
-- **Docker**: Container platform
-  - Multi-stage builds
-  - Docker Scout for vulnerability scanning
-  - Docker Compose for orchestration
-  
-- **Docker Hub**: Primary container registry
-  - Image storage and distribution
-  - Tag-based promotion workflow
-
-### 🔍 Quality & Security Tools
-
-- **SonarQube**: Code quality analysis
-  - Centralized SonarQube instance
-  - Integration with Docker Scout vulnerabilities
-  
-- **Docker Scout**: Container vulnerability scanning
-  - SARIF reporting
-  - Integration with SonarQube
-
-### 🔐 Reverse Proxy & SSL
-
-- **Traefik**: Reverse proxy and load balancer
-  - Automatic TLS certificate management
-  - Let's Encrypt integration
-  - Cloudflare DNS challenge for wildcard certificates
-
-### 💻 Supported Runtimes
-
-- **Node.js**: JavaScript/TypeScript applications
-  - npm, yarn, pnpm package managers
-  - ESLint for linting
-  - Jest for testing
-  
-- **Python**: Python applications
-  - pip, poetry, pipenv support
-  - Ruff/Flake8 for linting
-  - pytest for testing
-
-### ⚡ CI vs CD Separation
-
-- **CI Components**: Can be used standalone without CD
-  - Lint, test, build, scan stages work independently
-  - No dependency on deployment infrastructure for CI
-  
-- **CD Components**: Require specific infrastructure
-  - Deployment targets (VMs)
-  - DNS servers (BIND or Cloudflare)
-  - Traefik for routing
-  - Docker daemon access
-
-### 🔌 External Dependencies
-
-- **Cloudflare**: Multiple services
-  - DNS management for production
-  - Tunnel service for backend services
-  - Workers for webhook handling
-  
-- **Let's Encrypt**: SSL certificate authority
-  - Automatic certificate provisioning
-  - Wildcard certificates via DNS challenge
-
-## 📑 Table of Contents
-
-- [📑 Table of Contents](#table-of-contents)
-- [📌 Assumptions & Architecture](#assumptions-architecture)
-- [🚀 Quick Start](#quick-start)
-  - [1. Enable Shared Pipelines in Your Repo](#enable-shared-pipelines-in-your-repo)
-  - [2. Understanding YAML Imports](#understanding-yaml-imports)
-  - [3. Set Up Required Variables](#set-up-required-variables)
-  - [4. Create Self-Hosted Runners](#create-self-hosted-runners)
-  - [5. Set Up Deployment Environments](#set-up-deployment-environments)
-- [📋 Features](#features)
-  - [✅ Supported Technologies](#supported-technologies)
-  - [✅ Environments](#environments)
-  - [✅ Pipeline Stages](#pipeline-stages)
-  - [PR-Merged → Auto Teardown (Cloudflare Worker)](#pr-merged-auto-teardown-cloudflare-worker)
-- [🏗️ Architecture](#architecture)
-  - [A Typical Pipeline Flow (e.g. Preview Env)](#a-typical-pipeline-flow-e-g-preview-env)
-  - [Environment Routing](#environment-routing)
-  - [Decision Matrix by Environment](#decision-matrix-by-environment)
-- [🐳 Docker Compose Support](#docker-compose-support)
-  - [File Structure](#file-structure)
-  - [How Docker Compose Works](#how-docker-compose-works)
-  - [Image Tagging & Reuse](#image-tagging-reuse)
-- [🔧 Configuration](#configuration)
-  - [Package.json Scripts (Node.js)](#package-json-scripts-node-js)
-  - [Python Requirements](#python-requirements)
-  - [Dockerfile Best Practices](#dockerfile-best-practices)
-  - [Environment-Scoped Build Arguments (static builds)](#environment-scoped-build-arguments-static-builds)
-- [🌐 Traefik Integration](#traefik-integration)
-  - [Automatic TLS](#automatic-tls)
-  - [Dashboard Access](#dashboard-access)
-  - [Preview Environments](#preview-environments)
-  - [Dev/UAT/Prod Routing](#dev-uat-prod-routing)
-- [🔐 Cloudflare Tunnel (Backend without Public IP)](#cloudflare-tunnel-backend-without-public-ip)
-  - [Why Use Cloudflare Tunnel?](#why-use-cloudflare-tunnel)
-  - [Cloudflare Tunnel Setup](#cloudflare-tunnel-setup)
-  - [Backend Docker Compose Requirements](#backend-docker-compose-requirements)
-  - [How Cloudflare Tunnel Works](#how-cloudflare-tunnel-works)
-  - [Frontend Integration](#frontend-integration)
-  - [Cloudflare Tunnel Troubleshooting](#cloudflare-tunnel-troubleshooting)
-- [🔄 Cross-Repository Previews](#cross-repository-previews)
-  - [Cross-Repository Setup](#cross-repository-setup)
-  - [Cross-Repository Behavior](#cross-repository-behavior)
-  - [Feature Gate](#feature-gate)
-  - [Peer Host URLs Format](#peer-host-urls-format)
-  - [Trigger Loop Prevention](#trigger-loop-prevention)
-- [🔥 Hotfix Flow](#hotfix-flow)
-  - [Workflow](#workflow)
-  - [Tags](#tags)
-- [🚫 Stage Bypass Flags](#stage-bypass-flags)
-- [🏷️ Repository Type Flags](#repository-type-flags)
-  - [Repository Type Behavior](#repository-type-behavior)
-- [🔒 Admin Panel Security](#admin-panel-security)
-  - [IP Whitelist Ranges](#ip-whitelist-ranges)
-  - [How It Works](#how-it-works)
-  - [Security Model](#security-model)
-- [📊 Quality Gates](#quality-gates)
-  - [SonarQube Integration](#sonarqube-integration)
-  - [Docker Scout](#docker-scout)
-- [🛠️ Troubleshooting](#troubleshooting)
-  - [Common Issues](#common-issues)
-  - [Debug Commands](#debug-commands)
-- [🔍 Verifying Docker Scout Integration in SonarQube](#verifying-docker-scout-integration-in-sonarqube)
-  - [How to Check Docker Scout Results in SonarQube:](#how-to-check-docker-scout-results-in-sonarqube)
-  - [What You Should See:](#what-you-should-see)
-  - [Pipeline Logs to Check:](#pipeline-logs-to-check)
-  - [Troubleshooting Docker Scout Integration:](#troubleshooting-docker-scout-integration)
-- [📚 Examples](#examples)
-  - [Example 1: Backend API (with auto-detection)](#example-1-backend-api-with-auto-detection)
-  - [Example 2: Frontend App (with auto-detection)](#example-2-frontend-app-with-auto-detection)
-  - [Example 3: Admin Panel](#example-3-admin-panel)
-  - [Example 4: Hotfix Deployment](#example-4-hotfix-deployment)
-- [🤝 Contributing](#contributing)
-- [📄 License](#license)
-- [🆘 Support](#support)
-
 ## 🚀 Quick Start
 
 ### 1. Enable Shared Pipelines in Your Repo
@@ -225,6 +52,7 @@ The shared pipelines use Bitbucket's YAML import feature to reference pipeline c
 - **`general-pipeline-release`** - UAT pipeline (auto-detects: backend promotes, frontend rebuilds)
 - **`general-pipeline-main`** - Prod pipeline (auto-detects: backend promotes, frontend rebuilds)
 - **`general-pipeline-hotfix`** - Hotfix pipeline (build only - no deploy)
+- **`general-pipeline-ci-node`** - Node only: lint, test, build & push image (no Traefik/compose deploy; for K8s/GitOps)
 - **`general-pipeline-pr-traefik`** - Preview pipeline with Traefik (auto-detects project type)
 
 **Manual Triggers (custom pipelines):**
@@ -256,6 +84,15 @@ CLOUDFLARE_ACCOUNT_ID=your-cloudflare-account-id  # Required for Cloudflare Tunn
 INTERNAL_DNS_SERVER=your-internal-dns-server
 INTERNAL_DNS_TSIG_KEY_NAME=your-tsig-key-name
 INTERNAL_DNS_TSIG_KEY=your-tsig-key
+
+# Cisco Umbrella (optional, mirrors internal DNS entries)
+UMBRELLA_ORG_ID=8263853                       # See Umbrella dashboard URL
+UMBRELLA_API_KEY=umbrella-api-key
+UMBRELLA_API_SECRET=umbrella-api-secret
+UMBRELLA_DNS_FORWARDERS=10.25.9.9,10.25.9.10  # Resolver IPs Umbrella should forward to
+# Optional fine-tuning:
+# UMBRELLA_DESCRIPTION="Auto-managed by shared-pipelines"
+# UMBRELLA_STRICT_MODE=true   # Fail pipeline when Umbrella API is down (default is false)
 ```
 
 #### Repository Variables (Set per repo):
@@ -285,8 +122,19 @@ IS_BACKEND=true         # Backend/API: Enable promote flow, Cloudflare Tunnel in
 IS_ADMIN_PANEL=true     # Admin Panel: Use internal DNS in prod (private access) + IP whitelist
 # (No flag)             # Regular Frontend: Public access, Cloudflare DNS in prod
 
+# Internal-only service (no Traefik, no Cloudflare Tunnel):
+IS_INTERNAL_SERVICE=true  # Deploy as internal service only; no public routing (Traefik) and no Cloudflare Tunnel
+                          # Container is reachable only from other containers on shared Docker networks / host
+
 # ⚠️ IMPORTANT: Set the appropriate flag BEFORE deploying to UAT/Prod!
 # These flags control deployment flow and production routing behavior.
+
+# Promotion Flow (for non-static frontends like Next.js SSR, Nuxt, etc.):
+ENABLE_PROMOTE=true     # Enable promote flow (skip PROD rebuild, promote from UAT)
+                        # Use this for non-static frontends that should promote like backends
+                        # but still use Traefik routing (not Cloudflare Tunnel)
+                        # Example: Next.js SSR, Nuxt SSR, Remix, etc.
+
 ```
 
 **Backend-Specific (Required if IS_BACKEND=true):**
@@ -308,17 +156,30 @@ SKIP_BUILD=true
 SKIP_SCOUT=true
 SKIP_SONAR=true
 
+# Security Scanning
+ENABLE_ZAP_SCAN=true  # Enable OWASP ZAP security scan after UAT deployment (when the pipeline gate is enabled)
+                      # Scans deployed application and uploads results to SonarQube
+                      # Requires DOMAIN_NAME_UAT to be set. Note: In the pipeline the gate may be commented out so the step runs whenever the UAT pipeline includes it.
+
 # Cross-repo Peer Triggers (for multi-repo previews)
-PEER_REPOS=backend-api,auth-service  # Comma-separated list
+PEER_REPO_SLUGS=backend-api,auth-service  # Comma-separated list (or PEER_REPO_SLUG for single repo)
+
+# Pre-build Command (for monorepo shared directories)
+# ⚠️ IMPORTANT: Docker's build context does NOT follow symlinks outside the build context.
+# Use 'cp -r' to copy directories instead of 'ln -s' for symlinks.
+PRE_BUILD_COMMAND="cp -r /home/devadmin/with-zone/h-mall-shared ./h-mall-shared && rm -rf ./h-mall-shared/node_modules ./h-mall-shared/.git ./h-mall-shared/.env*"
 ```
 
 **Environment-Scoped Build Args (for static frontends):**
+
+**Note:** Use `USE_DEPLOYMENT_VARS=true` for both build and deployment stages. The old variable `USE_BITBUCKET_DEPLOYMENT_VARS` is still supported for backward compatibility.
 
 There are two methods to provide environment-specific build arguments:
 
 **Method 1: Bitbucket Deployment Variables API (Recommended)**
 ```bash
-# Set USE_BITBUCKET_DEPLOYMENT_VARS=true, then configure in Repository Settings → Deployments:
+# Set USE_DEPLOYMENT_VARS=true (or USE_BITBUCKET_DEPLOYMENT_VARS=true for backward compatibility)
+# Then configure in Repository Settings → Deployments:
 
 # In 'dev' deployment environment:
 API_BASE_URL=https://dev.api.example.com
@@ -349,14 +210,15 @@ API_BASE_URL_prod=https://api.example.com
 - ✅ No `VAR_<env>` suffix management in pipeline YAML
 - ✅ Dynamic updates without pipeline changes
 - ✅ Automatically falls back to Method 2 if disabled
+- ✅ Per-environment override: `USE_DEPLOYMENT_VARS_DEV`, `USE_DEPLOYMENT_VARS_UAT`, `USE_DEPLOYMENT_VARS_PROD` override the global flag for that environment
 
 See [BITBUCKET-DEPLOYMENT-API.md](BITBUCKET-DEPLOYMENT-API.md) for complete setup instructions.
 
 #### Deployment Environment Variables (Set in Bitbucket deployment environments):
 
-**For `preview` Deployment Environment (optional - or use with `USE_BITBUCKET_DEPLOYMENT_VARS=true`):**
+**For `preview` Deployment Environment (optional - or use with `USE_DEPLOYMENT_VARS=true`):**
 
-If using the **Deployment Variables API** (`USE_BITBUCKET_DEPLOYMENT_VARS=true`), you can centralize ALL preview configuration here:
+If using the **Deployment Variables API** (`USE_DEPLOYMENT_VARS=true` or `USE_BITBUCKET_DEPLOYMENT_VARS=true` for backward compatibility), you can centralize ALL preview configuration here:
 
 ```bash
 # In Repository Settings → Deployments → preview environment:
@@ -378,7 +240,7 @@ PEER_HOST_URLS=VITE_API_BASE_URL.backend-api,VITE_AUTH_URL.auth-service
 
 **Traditional Method (Repository Variables):**
 ```bash
-# If NOT using USE_BITBUCKET_DEPLOYMENT_VARS, set these as repository variables:
+# If NOT using USE_DEPLOYMENT_VARS (or USE_BITBUCKET_DEPLOYMENT_VARS), set these as repository variables:
 API_BASE_URL_preview=https://preview-api.example.com
 PEER_HOST_URLS=VITE_API_BASE_URL.backend-api,VITE_AUTH_URL.auth-service
 ```
@@ -435,9 +297,9 @@ Set up runners with these tags:
 
 Bitbucket cannot reach the internal webhook URL, So using a public Cloudflare Worker as the webhook endpoint to trigger teardown when a PR is merged into `dev`/`develop`.
 
-- **Worker URL**: [`https://preview-teardown.v-p-16d.workers.dev/bitbucket/pr-merged`](https://preview-teardown.v-p-16d.workers.dev/bitbucket/pr-merged)
+- **Worker URL**: [`https://preview-teardown.weareonwork.com/bitbucket/pr-merged`](https://preview-teardown.weareonwork.com/bitbucket/pr-merged)
 - **Bitbucket Webhook**: Repository → Settings → Webhooks
-  - **URL**: `https://preview-teardown.v-p-16d.workers.dev/bitbucket/pr-merged`
+  - **URL**: `https://preview-teardown.weareonwork.com/bitbucket/pr-merged`
   - **Trigger**: Pull request: merged
 - **Behavior**: The Worker invokes Bitbucket Pipelines API to run the consumer repo’s `manual-preview-teardown` custom pipeline on the PR’s destination branch.
 - **Auth**: It uses an access token with `pipelines:write` and `repository:write` as the Worker secret `BITBUCKET_ACCESS_TOKEN`.
@@ -448,245 +310,23 @@ Notes:
 
 ## 🏗️ Architecture
 
-### Complete Pipeline Flow
-
-#### Stage 1: Quality Assurance (Parallel Execution)
+### A Typical Pipeline Flow (e.g. Preview Env)
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Code Push/PR                              │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │
-                             ▼
-                ┌────────────────────────┐
-                │  Setup Shared Pipelines│
-                └────────────┬───────────┘
-                             │
-                ┌────────────┴────────────┐
-                │                         │
-                ▼                         ▼
-        ┌──────────────┐         ┌──────────────┐
-        │  Auto-Detect │         │  Auto-Detect │
-        │   Project    │         │   Project    │
-        │     Type     │         │     Type     │
-        └──────┬───────┘         └──────┬───────┘
-               │                        │
-               ▼                        ▼
-┌──────────────────────────┐  ┌──────────────────────────┐
-│  Node.js (package.json)  │  │  Python (pyproject.toml) │
-└──────────────────────────┘  └──────────────────────────┘
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│    Lint     │ -> │    Test     │ -> │    Build    │ -> │ DockerHub   │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+                                                                |
+                                                                V
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│   Deploy    │ <- │   Traefik   │ <- │   SonarQube │ <- │    Docker   │
+│    Env      │    │    Setup    │    │ QualityGate │    │    Scout    │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
-#### Stage 2: CI Pipeline (Quality Gates)
-```
-                    ┌────────────────────┐
-                    │   Shared Setup     │
-                    │  (Clone & Env)     │
-                    └──────────┬─────────┘
-                               │
-                    ┌──────────┴──────────┐
-                    │                     │
-                    ▼                     ▼
-        ┌──────────────────┐   ┌──────────────────┐
-        │   Lint Stage     │   │   Lint Stage     │
-        │  (ESLint/Node)   │   │  (Ruff/Python)   │
-        └────────┬─────────┘   └────────┬─────────┘
-                 │                     │
-                 └──────────┬──────────┘
-                            │
-                    ┌───────┴────────┐
-                    │                │
-                    ▼                ▼
-        ┌──────────────────┐   ┌──────────────────-┐
-        │   Test Stage     │   │    Test Stage     │
-        │  (Jest+Coverage) │   │ (pytest+Coverage) │
-        └────────┬─────────┘   └────────┬─────────-┘
-                 │                     │
-                 └──────────┬──────────┘
-                            │
-                    ┌───────┴────────┐
-                    │                │
-                    ▼                ▼
-        ┌──────────────────┐   ┌──────────────────┐
-        │  Build Stage     │   │  Build Stage     │
-        │ (Docker Node)    │   │(Docker Python)   │
-        └────────┬─────────┘   └────────┬─────────┘
-                 │                     │
-                 └──────────┬──────────┘
-                            │
-                            ▼
-        ┌───────────────────────────────────┐
-        │         Build Stage               │
-        │     (Image Tag & Push)            │
-        └───────────────┬───────────────────┘
-                        │
-                        ▼
-        ┌───────────────────────────────────┐
-        │        Scan Stage                 │
-        │  (Docker Scout + SonarQube)       │
-        │  ↘ Quality Gate Check → Continue  │
-        └───────────────┬───────────────────┘
-                        │
-                ┌───────┴───────┐
-                │               │
-                ▼               ▼
-       ┌───────────┐   ┌───────────┐
-       │  Backend  │   │  Frontend │
-       │  Promote  │   │  Rebuild  │
-       └───────────┘   └───────────┘
-```
-
-#### Stage 3: Deployment Flow (Environment-Specific)
-```
-Backend Flow (Promote):
-┌─────────┐   Promote   ┌─────────┐   Promote   ┌─────────┐
-│   Dev   │────────────>│   UAT   │────────────>│  Prod   │
-│ Tagged  │   Retag     │ Tagged  │   Retag     │ + Latest│
-└─────────┘             └─────────┘             └─────────┘
-
-Frontend Flow (Rebuild):
-┌─────────┐   Build     ┌─────────┐   Build     ┌─────────┐
-│   Dev   │────────────>│   UAT   │────────────>│  Prod   │
-│ Config  │             │ Config  │             │ + Latest│
-└─────────┘             └─────────┘             └─────────┘
-```
-
-#### Complete Deployment Architecture
-```
-┌────────────────────────────────────────────────────────────┐
-│                        Bitbucket                           │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  Consumer Repository → bitbucket-pipelines.yml       │  │
-│  │  Import: shared-pipelines:main:general-pipeline-*    │  │
-│  └────────────────┬─────────────────────────────────────┘  │
-└───────────────────┼────────────────────────────────────────┘
-                    │
-                    ▼
-┌────────────────────────────────────────────────────────────┐
-│              Shared Pipelines (This Repo)                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │  bitbucket-pipelines.yml (3867 lines)                │  │
-│  │  ├── Setup & Clone Steps                             │  │
-│  │  ├── Lint Steps (Cloud + Self-Hosted)                │  │
-│  │  ├── Test Steps (Cloud + Self-Hosted)                │  │
-│  │  ├── Build Steps                                     │  │
-│  │  ├── Scan Steps (Docker Scout)                       │  │
-│  │  ├── Quality Gate (SonarQube)                        │  │
-│  │  ├── Deploy Steps                                    │  │
-│  │  └── Teardown (Preview only - PR merged)             │  │
-│  └───────────────────┬──────────────────────────────────┘  │
-└──────────────────────┼─────────────────────────────────────┘
-                       │
-        ┌──────────────┼──────────────┐
-        │              │              │
-        ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│   DockerHub  │ │  SonarQube   │ │   Traefik    │
-│  Registry    │ │  Analysis    │ │   Reverse    │
-│              │ │              │ │   Proxy      │
-└──────┬───────┘ └──────────────┘ └──────┬───────┘
-       │                                 │
-       ▼                                 ▼
-┌──────────────────────────────────────────────┐
-│           Deployment Infrastructure          │
-│                                              │
-│    ┌────────┐  ┌────────┐  ┌────────┐        │
-│    │  Dev   │  │  UAT   │  │  Prod  │        │
-│    │  VM    │  │  VM    │  │  VM    │        │
-│    └───┬────┘  └───┬────┘  └───┬────┘        │
-│        │           │           │             │
-│        └───────────┴───────────┘             │
-│                    │                         │
-│                    ▼                         │
-│            ┌─────────────────┐               │
-│            │  Docker Compose │               │
-│            │   Containers    │               │
-│            └─────────────────┘               │
-└──────────────────────────────────────────────┘
-                       │
-        ┌──────────────┼──────────────┐
-        │              │              │
-        ▼              ▼              ▼
-┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-│  BIND DNS    │ │ Cloudflare   │ │   Users      │
-│  (Internal)  │ │ (Public)     │ │  Access      │
-└──────────────┘ └──────────────┘ └──────────────┘
-```
-
-### Runner Allocation Strategy
-```
-┌─────────────────────────────────────────────────────────────┐
-│                  Pipeline Trigger                           │
-│      (Branch Push, PR, Manual, Scheduled)                   │
-└───────────────────┬─────────────────────────────────────────┘
-                    │
-        ┌───────────┴───────────┐
-        │                       │
-        ▼                       ▼
-┌───────────────┐     ┌───────────────────┐
-│ Cloud Runners │     │ Self-Hosted       │
-│ (Atlassian)   │     │ Runners (Custom)  │
-├───────────────┤     ├───────────────────┤
-│ • Fast setup  │     │ • Docker socket   │
-│ • No cache    │     │ • Persistent cache│
-│ • Limited     │     │ • Internal access │
-│   resources   │     │ • Fast execution  │
-│               │     │ • Parallel stages │
-│ Tasks:        │     │                   │
-│ • Lint        │     │ Tasks:            │
-│ • Test        │     │ • Build           │
-│ (Optional)    │     │ • Deploy          │
-└───────────────┘     │ • SSL setup       │
-                      │ • DNS updates     │
-                      └───────────────────┘
-```
-
-### Environment Routing Architecture
-```
-User Request Flow by Environment:
-
-Production (Public):
-Backend (Cloudflare Tunnel):
-┌─────────┐     DNS   ┌──────────────┐    Cloudflare  ┌─────────────┐
-│  User   │──────────>│ Cloudflare   │    Tunnel      │  Backend    │
-│ Browser │           │   Edge       │───────────────>│  Container  │
-└─────────┘           └──────────────┘                └─────────────┘
-
-Frontend (Traefik):
-┌─────────┐     DNS   ┌──────────────┐    Traefik     ┌─────────────┐
-│  User   │──────────>│ Cloudflare   │    Reverse     │  Frontend   │
-│ Browser │           │   Edge       │───────────────>│  Container  │
-└─────────┘           └──────────────┘   Proxy (443)  └─────────────┘
-                             │
-                             ▼
-                    ┌─────────────────┐
-                    │  Cloudflare DNS │
-                    │  (proxied=true) │
-                    └─────────────────┘
-
-Dev/UAT (Internal):
-Backend & Frontend (Both via Traefik):
-┌─────────┐     Internal  ┌──────────────┐  Traefik   ┌──────────┐
-│Internal │     DNS (BIND)│  Traefik     │  Routing   │Container │
-│  User   │──────────────>│   Proxy      │───────────>│          │
-└─────────┘               └──────────────┘            └──────────┘
-                             │
-                             ▼
-                    ┌────────────────────┐
-                    │ Let's Encrypt Cert │
-                    │  (Wildcard *.dev)  │
-                    └────────────────────┘
-
-Preview (PR-based):
-Backend & Frontend (Both via Traefik):
-┌─────────┐   Dynamic DNS   ┌──────────────┐  Traefik  ┌──────────┐
-│Developer│────────────────>│   Traefik    │  Routing  │Preview   │
-│  via    │  preview-123    │   Proxy      │──────────>│Container │
-│  URL    │  internal.xyz   └──────────────┘           └──────────┘
-└─────────┘                                             
-                 ┌─────────────────────────────────┐
-                 │ PR-specific domain & isolation  │
-                 └─────────────────────────────────┘
-```
+### Environment Routing
+- **Dev/UAT/Prod**: Traefik + Let's Encrypt certificates
+- **Preview**: Traefik + dynamic routing per PR
+- **DNS**: Cloudflare (public) + BIND (internal)
 
 ### 🎯 Decision Matrix by Environment
 
@@ -719,7 +359,7 @@ your-repo/
 ├── docker-compose.preview.yml  # Preview-specific overrides (optional)
 ```
 
-### How Docker Compose Works
+### How It Works
 1. **Base file**: `docker-compose.yml` is always used as foundation
 2. **Environment override**: `docker-compose.{env}.yml` if it exists
 3. **Pipeline override**: `docker-compose.override.yml` is auto-generated with:
@@ -727,7 +367,10 @@ your-repo/
    - Traefik labels (to route traffic for http/https based hostnames)
    - Environment-specific variables
 
-### Image Tagging & Reuse
+### Environment-Scoped Build Arguments (static builds)
+See Configuration → Environment-Scoped Build Arguments for full details.
+
+Image Tagging & Reuse
 - Build stage computes and writes image tags into `.env` (appended if present):
   - `DEV_TAG=$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:dev-<short_commit>`
   - `UAT_TAG=$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:<release_tag>`
@@ -800,13 +443,139 @@ CMD ["npm", "start"]
 
 ### Dashboard Access
 - **URL**: `http://traefik.{domain}:8080`
-- **Toggle**: Set `TRAEFIK_DASHBOARD_ENABLED=false` to disable
+- **Toggle**: Dashboard is always enabled (Traefik started with `--api.dashboard=true`). A `TRAEFIK_DASHBOARD_ENABLED` variable is not yet implemented.
 - **Security**: UFW firewall rules automatically configured
 
 ### Preview Environments
 - **Routing**: Host-based routing via Traefik labels
 - **Isolation**: Each PR gets unique compose project name
 - **Networking**: Automatic Traefik network attachment
+
+### Database Restore in Preview Environments
+
+For preview deployments, you can automatically restore a database dump from your dev environment after containers start. This is useful for testing with realistic data without affecting dev.
+
+#### Setup
+
+Add these **Preview Deployment Variables** (Bitbucket → Deployments → preview environment) to enable database restore:
+
+```bash
+# Required
+DB_TYPE=postgres              # postgres, mysql, mariadb, or mongodb
+DB_SERVICE_NAME=db            # Name of database service in docker-compose.yml
+DB_NAME=myapp                 # Database name to restore into
+DB_DUMP_FROM_DEV=true         # Enables dump + restore from dev database
+DEV_DB_SOURCE=dev-db://dev-db-host:5432   # Format: dev-db://host:port
+DEV_DB_USER=postgres          # Dev database username
+DEV_DB_PASSWORD=secret        # Dev database password
+DEV_DB_NAME=myapp             # Dev database name
+
+# Optional
+DB_USER=postgres              # Default: postgres (postgres) or admin (mongodb)
+DB_PASSWORD=secret            # Auto-detected from docker-compose if not set
+DB_PORT=5432                  # Default: 5432 (postgres), 3306 (mysql), 27017 (mongodb)
+DB_DUMP_COMPRESSION=auto      # auto, gzip, bzip2, xz, or none (default: auto-detect)
+```
+
+**⚠️ Important for Dev DB Connection:**
+- **Connectivity Required**: Preview server must be able to reach dev DB host (network + firewall allow-list on the dev host side)
+- **Test Connectivity**: Before deployment, test from preview server:
+  ```bash
+  # Test PostgreSQL (port 5432)
+  telnet dev-db-host 5432
+  # Or using nc (netcat)
+  nc -zv dev-db-host 5432
+  
+  # Test MongoDB (port 27017)
+  telnet dev-db-host 27017
+  nc -zv dev-db-host 27017
+  ```
+- **If connectivity fails**: The script will error with clear instructions
+- **Skip dump entirely**: If `DB_DUMP_FROM_DEV` is not set or false, dump is skipped (script exits cleanly)
+
+#### How It Works
+
+1. **Containers start**: `docker-compose up -d` brings up all services including database
+2. **Database health check**: Script waits for database to be healthy (max 60s)
+3. **Dump retrieval**: Downloads/fetches dump from configured source
+4. **Database restore**: Drops existing database, recreates it, and restores dump
+5. **App initialization**: Additional wait time for app to connect to restored database
+
+#### Example docker-compose.yml
+
+```yaml
+services:
+  app:
+    image: myorg/myapp:latest
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:secret@db:5432/myapp
+
+  db:
+    image: postgres:15
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    environment:
+      POSTGRES_DB: myapp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - db-data:/var/lib/postgresql/data
+
+volumes:
+  db-data:
+```
+
+#### Connectivity Requirements (for dev-db:// source)
+
+Before using `dev-db://` source, ensure:
+
+1. **Network Connectivity**: Preview server can reach dev DB host
+   ```bash
+   # Test from preview server
+   telnet dev-db-host 5432    # PostgreSQL
+   telnet dev-db-host 27017   # MongoDB
+   ```
+
+2. **Dev DB Firewall**: Ensure the dev database host allows inbound connections from the preview server's IP (configure UFW/security groups on the dev host)
+
+3. **Dev DB Access**: Dev database must allow connections from preview server IP
+   - PostgreSQL: Check `pg_hba.conf` and `postgresql.conf` (listen_addresses)
+   - MongoDB: Check `mongod.conf` (bindIp) and firewall rules
+
+4. **Client Tools**: Required tools must be installed on preview server (helpers auto-attempt `apt-get install`, but you can install manually if desired):
+   - PostgreSQL: `postgresql-client` (provides `pg_dump`, `psql`, `pg_restore`)
+      ```bash
+      sudo apt-get update
+      sudo apt-get install -y postgresql-client
+      ```
+   - MongoDB: `mongodb-database-tools` + `mongodb-mongosh`
+      ```bash
+      # Ubuntu / Debian (MongoDB repo)
+      wget -qO - https://pgp.mongodb.com/server-6.0.asc | sudo tee /etc/apt/trusted.gpg.d/mongodb.asc
+      echo "deb [ arch=amd64,arm64 ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -sc)/mongodb-org/6.0 multiverse" | sudo tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+      sudo apt-get update
+      sudo apt-get install -y mongodb-database-tools mongodb-mongosh
+      ```
+   - Connectivity utilities (already present on most systems, but verify):
+      ```bash
+      sudo apt-get install -y netcat-openbsd telnet
+      ```
+
+#### Notes
+
+- **Preview only**: Database restore only runs when `TARGET_ENV=preview`
+- **Dump flag required**: For `dev-db://` source, set `DB_DUMP_FROM_DEV=true` or dump is skipped
+- **Non-blocking**: If restore fails, deployment continues (with warning)
+- **Auto-cleanup**: Temporary dump files are automatically removed
+- **Compression**: Automatically detects and handles gzip, bzip2, xz compression
+- **PostgreSQL**: Supports both SQL dumps and custom format (pg_dump -Fc)
+- **MongoDB**: Full support for archive format dumps (mongodump --archive)
 
 ### Dev/UAT/Prod Routing
 - Dev deploy uses `DOMAIN_NAME_DEV` directly in Traefik router rule: `Host(\`${DOMAIN_NAME_DEV}\`)`.
@@ -822,7 +591,9 @@ For production/UAT backend services that cannot rely on internal BIND DNS and ha
 - **Secure**: TLS termination at Cloudflare edge; tunnel traffic is encrypted.
 - **Simple**: No VPN or complex networking; just run cloudflared container.
 
-### Cloudflare Tunnel Setup
+### Setup
+
+#### Production (Automatic)
 
 For backend repos (`IS_BACKEND=true`), the `deploy-prod` step automatically:
 - Creates or reuses a Named Tunnel via Cloudflare API.
@@ -830,12 +601,38 @@ For backend repos (`IS_BACKEND=true`), the `deploy-prod` step automatically:
 - Creates/updates DNS CNAME (proxied).
 - Runs cloudflared container (if not already running).
 
+#### UAT (Optional via Flag)
+
+For UAT backends, you can optionally use Cloudflare Tunnel instead of Traefik by setting:
+```bash
+USE_CLOUDFLARE_TUNNEL_UAT=true  # Enable Cloudflare Tunnel for UAT backends
+IS_BACKEND=true                  # Required: must be a backend repo
+```
+
+When enabled, the `deploy-uat` step will:
+- Skip Traefik setup (same as prod)
+- Set up Cloudflare Tunnel with a separate container name (`cloudflared-backend-uat`)
+- Use `TUNNEL_HOSTNAME_UAT` if set, otherwise falls back to `DOMAIN_NAME_UAT`
+
 #### Required Variables (Repository or Deployment):
+
+**Common**
 ```bash
 CLOUDFLARE_API_TOKEN=your-api-token  # Scopes: Account Zero Trust Tunnels:Edit, DNS:Edit
 CLOUDFLARE_ACCOUNT_ID=your-account-id
+IS_BACKEND=true  # Required: must be a backend repo
+```
+
+**For Production:**
+```bash
 TUNNEL_HOSTNAME=be-api.prod.example.com  # Full hostname for your backend
 APP_PORT=8000  # Container port (pipeline auto-publishes to host)
+```
+
+**For UAT (when `USE_CLOUDFLARE_TUNNEL_UAT=true`):**
+```bash
+TUNNEL_HOSTNAME_UAT=be-api.uat.example.com  # UAT-specific hostname (or use DOMAIN_NAME_UAT)
+APP_PORT=8000  # Container port
 ```
 
 #### Optional Variables:
@@ -865,7 +662,7 @@ services:
       - "8000:8000"  # Auto-published for Cloudflare Tunnel
 ```
 
-### How Cloudflare Tunnel Works
+### How It Works
 
 1. **Pipeline runs `deploy-prod` step** for backend repo (`IS_BACKEND=true`).
 2. **Deploy checks if tunnel is running**; if not, auto-runs setup script.
@@ -883,7 +680,7 @@ services:
 - **Via Traefik**: FE Traefik proxies to `https://be-api.prod.example.com` (see Traefik Integration for routing setup).
 - **Via Kong**: Kong proxies to `https://be-api.prod.example.com`.
 
-### Cloudflare Tunnel Troubleshooting
+### Troubleshooting
 
 #### "APP_PORT is not set"
 - **Cause**: Neither `APP_PORT` nor `TUNNEL_SERVICE_URL` provided.
@@ -901,11 +698,61 @@ services:
 - **Cause**: Backend port not published, or incorrect `APP_PORT`.
 - **Fix**: Ensure `ports:` section in docker-compose matches `APP_PORT`. Check `docker ps` for port mappings.
 
+#### Internal DNS update returns `REFUSED`
+- **Cause**: The BIND server rejected the dynamic update (usually missing TSIG permissions or zone not configured).
+- **Fix**:
+  1. In Webmin (DNS server UI), open `/etc/bind/named.conf.local` for editing under **Servers → BIND DNS Server***
+  2. For the zone you are onboarding (e.g.; `homnifi.com`), ensure the zone stanza includes an update policy, for example:
+     ```conf
+     allow-update { key "tsig-key"; };
+     ```
+  3. Access the shell under **Tools → Command Shell**; and run the following commands:
+     ```bash
+     sudo named-checkconf
+     # If `named-checkconf` reports an error, fix the syntax before reloading.
+     sudo systemctl reload named
+     ```
+  4. Re-run the pipeline step; the dynamic A record update should now succeed.
+
+- **Additional manual step**: For every new internal-only domain, add it in Cisco Umbrella.
+  - ✅ **Now automated**: when `UMBRELLA_API_KEY`, `UMBRELLA_API_SECRET`, and `UMBRELLA_ORG_ID` are present, the pipeline automatically mirrors each BIND A record into Cisco Umbrella’s **Deployments → Configuration → Domain Management** list using `scripts/dns/umbrella/sync_internal_domain.sh`.
+  - ⚙️ Configure Umbrella sync by setting:
+    - `UMBRELLA_ORG_ID` – numeric org ID from the Umbrella dashboard URL.
+    - `UMBRELLA_API_KEY` / `UMBRELLA_API_SECRET` – key pair with Deployments → Internal Domain **read/write** scope.
+    - `UMBRELLA_DNS_FORWARDERS` – comma-separated resolver IPs Umbrella should forward to (defaults to `INTERNAL_DNS_SERVER` when omitted).
+    - Optional: `UMBRELLA_DESCRIPTION`, `UMBRELLA_API_BASE`, `UMBRELLA_STRICT_MODE=true` (default false → warn only; set true to fail when Umbrella API is down).
+  - 📒 The sync is idempotent: existing entries are updated in-place; new preview/dev/uat/prod hostnames are appended automatically.
+
+#### Cloudflare Tunnel Debug (DNS and Reachability)
+Use these quick checks with your hostname in `TUNNEL_HOSTNAME`:
+
+```bash
+# 1) Check DNS via Cloudflare resolver (bypasses local cache)
+dig +short A ${TUNNEL_HOSTNAME} @1.1.1.1
+dig +short AAAA ${TUNNEL_HOSTNAME} @1.1.1.1
+
+# If your local resolver is stale, flush and retry (macOS)
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+
+# 2) Verify HTTP reachability through Cloudflare
+curl -I https://${TUNNEL_HOSTNAME}
+
+# 3) Check tunnel container health on the server
+docker logs -f cloudflared-backend
+
+# 4) Verify backend service locally on the server
+curl -I http://127.0.0.1:${APP_PORT:-8000}
+```
+
+Notes:
+- Proxied CNAMEs are flattened by Cloudflare; use A/AAAA lookups to verify.
+- HTTP 502 typically means DNS and tunnel are OK, but the backend at `127.0.0.1:${APP_PORT}` isn’t responding.
+
 ## 🔄 Cross-Repository Previews
 
 Enable peer previews for frontend/backend coordination:
 
-### Cross-Repository Setup
+### Setup
 ```bash
 # In your repo variables
 PEER_REPO_SLUGS=frontend-repo,backend-repo
@@ -916,7 +763,7 @@ Note on where to set PEER_HOST_URLS
 - Preview flow (static repos): set as Repository variables so values are available at build time.
 - Preview flow (dynamic repos): set under the `preview` Deployment environment variables so PRs can override per-run.
 
-### Cross-Repository Behavior
+### Behavior
 - **Automatic triggers**: Peer repos deploy when source repo builds
 - **URL sharing**: Cross-service URLs automatically computed
 - **Isolation**: Each repo maintains separate preview environment
@@ -985,10 +832,11 @@ Skip stages without editing pipeline:
 ```bash
 # Repository variables
 SKIP_LINT=true          # Skip lint stage
-SKIP_TEST=true          # Skip test stage  
+SKIP_TEST=true          # Skip test stage (SKIP_TESTS also supported)
 SKIP_BUILD=true         # Skip build stage
 SKIP_SCOUT=true         # Skip Docker Scout
-SKIP_SONAR=true         # Skip SonarQube
+SKIP_SONAR=true         # Skip SonarQube (SONAR_SKIP also supported)
+SKIP_SONAR_CLEANUP=true # Skip SonarQube project cleanup
 ```
 
 ## 🏷️ Repository Type Flags
@@ -1001,7 +849,7 @@ IS_BACKEND=true         # Backend repo: promote flow, Cloudflare Tunnel in prod
 IS_ADMIN_PANEL=true     # Admin panel: rebuild flow, internal DNS in prod + IP whitelist
 ```
 
-### Repository Type Behavior
+### Behavior:
 
 **UAT Environment:**
 - All repos: Traefik routing + internal DNS
@@ -1017,18 +865,18 @@ IS_ADMIN_PANEL=true     # Admin panel: rebuild flow, internal DNS in prod + IP w
 
 Admin panels (`IS_ADMIN_PANEL=true`) are automatically secured with IP whitelisting:
 
-### IP Whitelist Ranges
+### **IP Whitelist Ranges:**
 - `10.0.0.0/8` - Private Class A networks
 - `172.16.0.0/12` - Private Class B networks  
 - `192.168.0.0/16` - Private Class C networks
 
-### How It Works
+### **How It Works:**
 - **Automatic**: Pipeline detects `IS_ADMIN_PANEL=true` and applies IP restrictions
 - **Traefik Middleware**: Uses `admin-ip-whitelist` middleware for access control
 - **Internal Only**: Only accessible from internal/private networks
 - **Public Blocked**: External internet traffic is automatically blocked
 
-### Security Model
+### **Security Model:**
 ```
 admin.internal.example.com:
 ├── DNS: Internal BIND server → Internal IP
@@ -1108,6 +956,69 @@ Note: Dev deploy defaults to `APP_PORT=80` if not provided.
 - **Fix**: Set required variables:
   - For dev: `INTERNAL_DNS_SERVER`, `INTERNAL_DNS_TSIG_KEY_NAME`, `INTERNAL_DNS_TSIG_KEY`
   - For uat/prod: `CLOUDFLARE_API_TOKEN`
+
+#### "MongoDB/PostgreSQL connection timeout from containers"
+- **Cause**: Database running on host, containers can't reach it via `localhost` or hostname
+- **Problem**: Hardcoding Docker network IPs (e.g., `172.17.0.0/16`) breaks when Docker creates new networks
+- **Solutions** (choose one):
+
+  **Option 1: Use `extra_hosts` in docker-compose (Recommended)**
+  ```yaml
+  # In your docker-compose.yml or docker-compose.dev.yml
+  services:
+    your-app:
+      extra_hosts:
+        - "db-host:10.25.9.9"  # Maps db-host to host's private IP
+      environment:
+        - DATABASE_URL=mongodb://db-host:27017/mydb  # Use db-host instead of IP
+  ```
+  - **Pros**: Works regardless of Docker network changes, clean hostname
+  - **Cons**: Requires updating connection strings to use `db-host`
+
+  **Option 2: Use broader UFW rule (Covers all Docker networks)**
+  ```bash
+  
+  # This allows Docker containers (FROM 172.16.0.0/12) to connect TO the host on port 27017
+  sudo ufw allow from 172.16.0.0/12 to any port 27017 proto tcp comment "Docker networks to MongoDB"
+  ```
+  - **Pros**: Simple, covers all possible Docker networks (172.16.0.0 to 172.31.255.255)
+  - **Cons**: Slightly less restrictive (but still private IP range)
+  - **Note**: The rule `ALLOW IN 10.25.9.9` is NOT needed - that would allow traffic FROM the host IP, not TO it
+
+  **Option 3: Bind database to 0.0.0.0 and use host IP**
+  ```yaml
+  # MongoDB config
+  net:
+    port: 27017
+    bindIp: 0.0.0.0  # Listen on all interfaces
+  ```
+  ```bash
+  # UFW rule for host IP
+  sudo ufw allow 27017/tcp from 172.16.0.0/12 comment "Docker networks"
+  sudo ufw allow 27017/tcp from 10.0.0.0/8 comment "Private networks"
+  ```
+  - **Pros**: Most flexible, works with any network
+  - **Cons**: Database listens on all interfaces (ensure proper firewall rules)
+
+  **Option 4: Dynamically detect Docker networks (Advanced)**
+  ```bash
+  # Script to auto-add UFW rules for all Docker networks
+  for net in $(docker network ls --format "{{.ID}}"); do
+    subnet=$(docker network inspect $net --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null)
+    if [ -n "$subnet" ]; then
+      sudo ufw allow 27017/tcp from $subnet comment "Docker network $net" || true
+    fi
+  done
+  ```
+  - **Pros**: Automatically adapts to new networks
+  - **Cons**: Requires running script periodically or on network creation
+
+**Recommended Approach**: Use **Option 1** (`extra_hosts`) + **Option 2** (broad UFW rule) for maximum reliability.
+
+**Understanding UFW Rule Direction:**
+- `ufw allow from 172.16.0.0/12 to any port 27017` = Allow FROM Docker networks TO host port 27017 ✅ (What you need)
+- The host connects to MongoDB via `localhost` (127.0.0.1), not via its own private IP
+- Containers connect to MongoDB via the host's private IP (`10.25.9.9:27017`)
 
 ### Debug Commands
 ```bash
@@ -1301,7 +1212,7 @@ git merge hotfix/1.2.1
 
 ## 📄 License
 
-This project is licensed under the..  - just kidding :)
+This project is licensed under the LMNTO License - just kidding :)
 
 ## 🆘 Support
 

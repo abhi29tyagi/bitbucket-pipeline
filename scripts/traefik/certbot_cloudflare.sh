@@ -113,15 +113,25 @@ docker run --rm \
   --email "$EMAIL" \
   --dns-cloudflare --dns-cloudflare-credentials /cloudflare/credentials.ini \
   -d "*.${FQDN}" -d "${FQDN}" \
-  --cert-name "$CERT_NAME" || {
+  --cert-name "$CERT_NAME" \
+  --disable-hook-validation || {
     echo "ERROR: certbot failed"
     exit 1
   }
 
 echo "🔍 Verifying certificate files on host filesystem..."
 
-FULLCHAIN="$LETSENCRYPT_DIR/live/$CERT_NAME/fullchain.pem"
-PRIVKEY="$LETSENCRYPT_DIR/live/$CERT_NAME/privkey.pem"
+# Resolve the actual certificate paths from Certbot's renewal config.
+# This avoids hard-coding the live directory name (e.g. homnifi.com vs homnifi.com-0001).
+RENEWAL_CONF="$LETSENCRYPT_DIR/renewal/$CERT_NAME.conf"
+if [ -f "$RENEWAL_CONF" ]; then
+  FULLCHAIN="$(grep '^fullchain' "$RENEWAL_CONF" | awk -F' = ' '{print $2}')"
+  PRIVKEY="$(grep '^privkey' "$RENEWAL_CONF" | awk -F' = ' '{print $2}')"
+else
+  # Fallback to legacy behavior if renewal config is missing
+  FULLCHAIN="$LETSENCRYPT_DIR/live/$CERT_NAME/fullchain.pem"
+  PRIVKEY="$LETSENCRYPT_DIR/live/$CERT_NAME/privkey.pem"
+fi
 
 echo "📜 Certificate files:"
 echo "   - $FULLCHAIN"

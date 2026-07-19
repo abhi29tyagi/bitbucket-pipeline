@@ -10,7 +10,8 @@ log_info "DNS create requested for ENVIRONMENT=${ENVIRONMENT}"
 
 if [ "$ENVIRONMENT" = "production" ] || [ "$ENVIRONMENT" = "prod" ]; then
   # Prod: admin panel uses internal DNS, regular frontend uses Cloudflare DNS
-  if [ "${IS_ADMIN_PANEL}" = "true" ]; then
+  IS_ADMIN_PANEL="${IS_ADMIN_PANEL:-false}"
+  if [ "$IS_ADMIN_PANEL" = "true" ]; then
     log_info "Admin panel in prod: dispatching to Internal DNS create"
     "$(dirname "$0")/internal/internal_dns_create.sh"
   else

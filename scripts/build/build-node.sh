@@ -1,18 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Debug: Show where we are and what files exist
-echo "=== DEBUG: Script Execution Context ==="
-echo "Current directory: $(pwd)"
-echo "Directory contents:"
-ls -lrth
-echo "Parent directory (..):"
-ls -lrth .. 2>/dev/null || echo "Cannot access parent directory"
-echo "Looking for package.json:"
-echo "  ./package.json exists? $([ -f ./package.json ] && echo 'YES' || echo 'NO')"
-echo "  ../package.json exists? $([ -f ../package.json ] && echo 'YES' || echo 'NO')"
-echo "=== END DEBUG ==="
-echo ""
+echo "=== shared-pipelines build-node.sh: start (version: $(git rev-parse --short HEAD 2>/dev/null || echo local)) ==="
 
 # Ensure we're in the workspace root (where consumer repo was cloned)
 if [ -d "../.git" ] && [ ! -f "./package.json" ] && [ -f "../package.json" ]; then
@@ -87,24 +76,33 @@ if [[ "$BITBUCKET_BRANCH" =~ ^hotfix/ ]]; then
 fi
 
 # Get build arguments - Check if Bitbucket Deployment Variables is enabled (opt-in feature)
-if [ "${USE_BITBUCKET_DEPLOYMENT_VARS:-false}" = "true" ]; then
+# Support both USE_DEPLOYMENT_VARS (new) and USE_BITBUCKET_DEPLOYMENT_VARS (backward compatibility)
+USE_DEPLOYMENT_VARS="${USE_DEPLOYMENT_VARS:-${USE_BITBUCKET_DEPLOYMENT_VARS:-false}}"
+BUILD_ARGS=()  # always treat build args as an array to preserve spaces in values
+
+if [ "${USE_DEPLOYMENT_VARS}" = "true" ]; then
   echo "Bitbucket Deployment Variables enabled, attempting to fetch deployment variables..."
   
   # Source API utilities
   if [ -f "shared-pipelines/scripts/utils/bitbucket-api.sh" ]; then
     source "shared-pipelines/scripts/utils/bitbucket-api.sh"
-    BUILD_ARGS=$(get_build_args_with_api "$TARGET_ENV")
+    # get_build_args_with_api outputs KEY=VALUE lines; convert to --build-arg entries
+    if BUILD_ARG_LINES=$(get_build_args_with_api "$TARGET_ENV"); then
+      while IFS= read -r kv; do
+        [ -z "$kv" ] && continue
+        BUILD_ARGS+=("--build-arg" "$kv")
+      done <<< "$BUILD_ARG_LINES"
+    fi
   else
-    echo "WARNING: USE_BITBUCKET_DEPLOYMENT_VARS=true but API utilities not found, falling back to environment variables"
-    USE_BITBUCKET_DEPLOYMENT_VARS="false"
+    echo "WARNING: USE_DEPLOYMENT_VARS=true but API utilities not found, falling back to environment variables"
+    USE_DEPLOYMENT_VARS="false"
   fi
 fi
 
 # Fallback method (default): Normalize and pass VAR_<TARGET_ENV> as build args e.g. VAR_preview -> VAR
 # Supports both lowercase (VAR_dev) and uppercase (VAR_DEV) suffixes
-if [ "${USE_BITBUCKET_DEPLOYMENT_VARS:-false}" != "true" ]; then
+if [ "${USE_DEPLOYMENT_VARS}" != "true" ]; then
   echo "Using environment variable method for build args"
-  BUILD_ARGS=""
   TARGET_ENV_LOWER="${TARGET_ENV,,}"  # lowercase
   TARGET_ENV_UPPER="${TARGET_ENV^^}"  # uppercase
 
@@ -113,7 +111,7 @@ if [ "${USE_BITBUCKET_DEPLOYMENT_VARS:-false}" != "true" ]; then
       *_"$TARGET_ENV_LOWER"|*_"$TARGET_ENV_UPPER")
         __base="${__n%_*}"
         export "$__base=$__v"
-        [ -n "$__v" ] && BUILD_ARGS="$BUILD_ARGS --build-arg $__base=$__v"
+        [ -n "$__v" ] && BUILD_ARGS+=("--build-arg" "$__base=$__v")
       ;;
     esac
   done < <(env)
@@ -121,6 +119,8 @@ fi
 
 # Also support peer service URL generation in build (like deploy)
 # Format: PEER_HOST_URLS="FRONTEND_URL.zenit-claim-app,BACKEND_URL.zenit-claim-api"
+# You can append an extra key after the app slug (e.g. `BACKEND_URL.zenit-claim-api.admin`)
+# to generate `https://admin-preview-<key>-zenit-claim-api.internal...`.
 if [ "$TARGET_ENV" = "preview" ] && [ -n "${PEER_HOST_URLS:-}" ]; then
   # Derive PREVIEW_KEY similarly to deploy logic
   PREVIEW_KEY_DERIVED="${PREVIEW_SLUG#preview-}"
@@ -129,22 +129,65 @@ if [ "$TARGET_ENV" = "preview" ] && [ -n "${PEER_HOST_URLS:-}" ]; then
   IFS=',' read -r -a __pairs <<< "${PEER_HOST_URLS}"
   for __pair in "${__pairs[@]}"; do
     __pair="$(echo "${__pair}" | xargs)"; [ -z "${__pair}" ] && continue
-    __var_name="${__pair%%.*}"; __app_slug="${__pair#*.}"
+    __var_name="${__pair%%.*}"
+    __slug_and_key="${__pair#*.}"
+    # For VAR.app.extra format, extract extra key and prepend to host
+    # Examples:
+    #   MINIO_EXTERNAL_ENDPOINT.homnifi-machine-service.minio → minio-preview-<key>-homnifi-machine-service.internal...
+    __app_slug="${__slug_and_key}"
+    __extra_key=""
+    if [[ "${__slug_and_key}" == *.* ]]; then
+      __extra_key="${__slug_and_key##*.}"
+      __app_slug="${__slug_and_key%.*}"
+    fi
     __host="preview-${PREVIEW_KEY_USE}-${__app_slug}.internal.${PREVIEW_DOMAIN_NAME}"
+    if [ -n "${__extra_key}" ] && [ "${__extra_key}" != "${__slug_and_key}" ]; then
+      __host="${__extra_key}-${__host}"
+    fi
     __url="https://${__host}"
     export "${__var_name}=${__url}"
     BUILD_ARGS="$BUILD_ARGS --build-arg ${__var_name}=${__url}"
   done
 fi
-if [ -n "$BUILD_ARGS" ]; then
-  echo "Build args (static): $BUILD_ARGS"
-  echo "Build args length: ${#BUILD_ARGS} characters"
-  echo "Number of build args: $(echo "$BUILD_ARGS" | grep -o '\--build-arg' | wc -l | tr -d ' ')"
+if ((${#BUILD_ARGS[@]} > 0)); then
+  # Log build args safely without affecting how they're passed to docker
+  printf -v BUILD_ARGS_LOG '%q ' "${BUILD_ARGS[@]}"
+  echo "Build args (static): $BUILD_ARGS_LOG"
+  echo "Build args length: ${#BUILD_ARGS_LOG} characters"
+  # Each build arg is stored as pair: --build-arg, KEY=VALUE
+  echo "Number of build args: $((${#BUILD_ARGS[@]} / 2))"
+fi
+
+# Run pre-build command if provided (e.g., for monorepo shared directories)
+# NOTE: Docker's build context does NOT follow symlinks outside the build context.
+# Use 'cp -r' to copy directories instead of 'ln -s' for symlinks.
+# Example: cp -r /path/to/shared ./shared && rm -rf ./shared/node_modules ./shared/.git
+if [ -n "${PRE_BUILD_COMMAND:-}" ]; then
+  echo "=== Pre-build command debug ==="
+  echo "Running pre-build command: $PRE_BUILD_COMMAND"
+  eval "$PRE_BUILD_COMMAND" || {
+    echo "ERROR: Pre-build command failed"
+    exit 1
+  }
+  echo "current directory: $(pwd)"
+  echo "directory contents:"
+  ls -la
+  echo "================================="
 fi
 
 echo "Building Docker image..."
-# Use eval to properly handle long BUILD_ARGS with multiple arguments
-eval "docker build $BUILD_ARGS -t \"$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT\" ." || {
+# Classic docker build (avoid buildx CLI quirks with long arg lists)
+# Prefer classic docker build (avoid buildx CLI quirks with long arg lists)
+unset DOCKER_BUILDKIT || true
+
+# Build docker command safely without eval to avoid issues with special characters (&, ?, # etc.)
+# Use 'docker image build' to bypass any buildx aliasing of 'docker build'
+BUILD_CMD=(docker image build)
+if ((${#BUILD_ARGS[@]} > 0)); then
+  BUILD_CMD+=("${BUILD_ARGS[@]}")
+fi
+BUILD_CMD+=(-t "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$BITBUCKET_COMMIT" ".")
+"${BUILD_CMD[@]}" || {
   echo "ERROR: Docker build failed"
   exit 1
 }

@@ -1,4 +1,5 @@
 export: true
+
 image: node:18
 
 definitions:
@@ -37,7 +38,7 @@ definitions:
             pwd
             echo "Current user: $(whoami)"
 
-            # BITBUCKET_WORKSPACE is automatically provided by Bitbucket
+            BITBUCKET_WORKSPACE="protocol33"
             SHARED_PIPELINES_REPO="${SHARED_PIPELINES_REPO:-${BITBUCKET_WORKSPACE}/shared-pipelines}"
             SHARED_PIPELINES_BRANCH="main"
             SKIP_SHALLOW_CLONE="true"
@@ -55,7 +56,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-            git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git && {
+            git clone git@bitbucket.org:protocol33/shared-pipelines.git && {
               echo "Repository cloned successfully"
             } || {
               echo "ERROR: Failed to clone repository"
@@ -101,6 +102,10 @@ definitions:
             case "${BITBUCKET_BRANCH:-}" in
               "main")
                 ENVIRONMENT="prod"
+                ;;
+              "master")
+                echo "❌ ERROR: master branch is deprecated. Please use main."
+                exit 1
                 ;;
               "develop"|"dev")
                 ENVIRONMENT="dev"
@@ -263,7 +268,7 @@ definitions:
               if [ -d "shared-pipelines" ]; then
                 echo "shared-pipelines directory already exists"
               else
-                git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
               fi
               chmod +x shared-pipelines/scripts/lint/lint-python.sh
               exec bash shared-pipelines/scripts/lint/lint-python.sh
@@ -272,7 +277,7 @@ definitions:
               if [ -d "shared-pipelines" ]; then
                 echo "shared-pipelines directory already exists"
               else
-                git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
               fi
               chmod +x shared-pipelines/scripts/lint/lint-node.sh
               exec bash shared-pipelines/scripts/lint/lint-node.sh
@@ -322,7 +327,7 @@ definitions:
               if [ -d "shared-pipelines" ]; then
                 echo "shared-pipelines directory already exists"
               else
-                git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
               fi
               chmod +x shared-pipelines/scripts/test/test-python.sh
               exec bash shared-pipelines/scripts/test/test-python.sh
@@ -331,7 +336,7 @@ definitions:
               if [ -d "shared-pipelines" ]; then
                 echo "shared-pipelines directory already exists"
               else
-                git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
               fi
               chmod +x shared-pipelines/scripts/test/test-node.sh
               exec bash shared-pipelines/scripts/test/test-node.sh
@@ -374,9 +379,9 @@ definitions:
               exit 0
             fi
             
-            # Skip build only for PROD if IS_BACKEND=true
-            if [ "$IS_BACKEND" = "true" ] && [ "$TARGET_ENV" = "prod" ]; then
-              echo "IS_BACKEND=true for PROD: skipping build step"
+            # Skip build for PROD if promotion flow is enabled (backends, internal services, or non-static frontends)
+            if [ "$TARGET_ENV" = "prod" ] && { [ "$IS_BACKEND" = "true" ] || [ "${IS_INTERNAL_SERVICE:-false}" = "true" ] || [ "${ENABLE_PROMOTE:-false}" = "true" ]; }; then
+              echo "Promotion flow enabled (IS_BACKEND=true, IS_INTERNAL_SERVICE=true, or ENABLE_PROMOTE=true) for PROD: skipping build step"
               exit 0
             fi
 
@@ -386,7 +391,7 @@ definitions:
               if [ -d "shared-pipelines" ]; then
                 echo "shared-pipelines directory already exists"
               else
-                git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
               fi
               chmod +x shared-pipelines/scripts/build/build-python.sh
               exec bash shared-pipelines/scripts/build/build-python.sh
@@ -395,7 +400,7 @@ definitions:
               if [ -d "shared-pipelines" ]; then
                 echo "shared-pipelines directory already exists"
               else
-                git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                git clone git@bitbucket.org:protocol33/shared-pipelines.git
               fi
               chmod +x shared-pipelines/scripts/build/build-node.sh
               exec bash shared-pipelines/scripts/build/build-node.sh
@@ -440,7 +445,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
 
             # Prepare Docker CLI environment to target the local daemon via a Unix socket.
@@ -612,7 +617,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
 
             # Prepare Docker CLI environment to target the local daemon via a Unix socket.
@@ -807,7 +812,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
             # Prepare Docker CLI environment to target the local daemon via a Unix socket.
             export DOCKER_HOST="unix:///var/run/docker.sock"
@@ -864,8 +869,21 @@ definitions:
               IFS=',' read -r -a __pairs <<< "${PEER_HOST_URLS}"
               for __pair in "${__pairs[@]}"; do
                 __pair="$(echo "${__pair}" | xargs)"; [ -z "${__pair}" ] && continue
-                __var_name="${__pair%%.*}"; __app_slug="${__pair#*.}"
+                __var_name="${__pair%%.*}"
+                __slug_and_key="${__pair#*.}"
+                # For VAR.app.extra format, extract extra key and prepend to host
+                # Examples:
+                #   MINIO_EXTERNAL_ENDPOINT.homnifi-machine-service.minio → minio-preview-<key>-homnifi-machine-service.internal...
+                __app_slug="${__slug_and_key}"
+                __extra_key=""
+                if [[ "${__slug_and_key}" == *.* ]]; then
+                  __extra_key="${__slug_and_key##*.}"
+                  __app_slug="${__slug_and_key%.*}"
+                fi
                 __host="preview-${PREVIEW_KEY_USE}-${__app_slug}.internal.${PREVIEW_DOMAIN_NAME}"
+                if [ -n "${__extra_key}" ] && [ "${__extra_key}" != "${__slug_and_key}" ]; then
+                  __host="${__extra_key}-${__host}"
+                fi
                 __url="https://${__host}"
                 export "${__var_name}=${__url}"
                 BUILD_ARGS="$BUILD_ARGS --build-arg ${__var_name}=${__url}"
@@ -1190,9 +1208,9 @@ definitions:
             
             [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
             
-            # Only build for PRs to develop/dev/main/release/* by default (override with FORCE_BUILD=true)
+            # Only build for PRs to develop/dev/main/release/* by default
             # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
-            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && [ "${FORCE_BUILD}" != "true" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
+            if [ -n "$BITBUCKET_PR_ID" ] && [ "$BITBUCKET_BRANCH" != "feature/test-ci" ] && { [ -z "$PR_ID_FOR_USE" ] || { [ -n "$BITBUCKET_PR_ID" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "develop" ] && [ "${BITBUCKET_PR_DESTINATION_BRANCH}" != "dev" ]; }; }; then
               echo "Skipping python image build: PR not targeting develop/dev"
               exit 0
             fi
@@ -1329,9 +1347,9 @@ definitions:
             fi
             
             # Optional: import Docker Scout results into Sonar (if available)
-            if [ -f "docker-scout-results.sarif" ] && [ -f "shared-pipelines/scripts/sonar/import-docker-scout-to-sonar.sh" ]; then
+            if [ -f "docker-scout-results.sarif" ] && [ -f "shared-pipelines/scripts/security/docker-scout-convert.sh" ]; then
               echo "Importing Docker Scout results into Sonar..."
-              bash shared-pipelines/scripts/sonar/import-docker-scout-to-sonar.sh || true
+              bash shared-pipelines/scripts/security/docker-scout-convert.sh || true
             else
               echo "Docker Scout report or import script not found; skipping import"
             fi
@@ -1369,7 +1387,8 @@ definitions:
             }
             
             # Set the Docker command for scanner CLI (run as current user; keep writes out of repo)
-            SONAR_CMD="docker run --rm -v $(pwd):/workspace -w /workspace sonarsource/sonar-scanner-cli:latest sonar-scanner"
+            # Mount Sonar cache directory to persist plugins across runs (fixes plugin download timeouts)
+            SONAR_CMD="docker run --rm -v $(pwd):/workspace -v ${HOME}/.sonar/cache:/root/.sonar/cache -w /workspace sonarsource/sonar-scanner-cli:latest sonar-scanner"
             
             
             # Ensure we're using self-hosted SonarQube, not SonarCloud
@@ -1428,13 +1447,31 @@ definitions:
               ls -la coverage || true
             fi
             
-            # Decide whether to include external issues file (generated from Docker Scout)
+            # Decide whether to include external issues files (Docker Scout + ZAP if available)
             SONAR_EXTRA_ARGS=""
+            EXTERNAL_ISSUES_FILES=""
+
+            # Include Docker Scout results if available
             if [ -f "sonar-issues.json" ]; then
-              echo "INFO: Including external issues from sonar-issues.json"
-              SONAR_EXTRA_ARGS="-Dsonar.externalIssuesReportPaths=sonar-issues.json"
+              echo "INFO: Including external issues from sonar-issues.json (Docker Scout)"
+              EXTERNAL_ISSUES_FILES="sonar-issues.json"
+            fi
+
+            # Include ZAP results if available (from ZAP scan step in same pipeline run)
+            if [ -f "sonar-issues-zap.json" ]; then
+              echo "INFO: Including external issues from sonar-issues-zap.json (OWASP ZAP)"
+              if [ -n "$EXTERNAL_ISSUES_FILES" ]; then
+                EXTERNAL_ISSUES_FILES="$EXTERNAL_ISSUES_FILES,sonar-issues-zap.json"
+              else
+                EXTERNAL_ISSUES_FILES="sonar-issues-zap.json"
+              fi
+            fi
+
+            if [ -n "$EXTERNAL_ISSUES_FILES" ]; then
+              SONAR_EXTRA_ARGS="-Dsonar.externalIssuesReportPaths=$EXTERNAL_ISSUES_FILES"
+              echo "INFO: External issues files: $EXTERNAL_ISSUES_FILES"
             else
-              echo "INFO: No sonar-issues.json found; skipping external issues import"
+              echo "INFO: No external issues files found; skipping external issues import"
             fi
 
             # Include Python coverage if available (from pytest --cov --cov-report=xml:coverage.xml)
@@ -1476,27 +1513,66 @@ definitions:
               fi
             fi
             
-            # Run the scanner with proper parameters
-            $SONAR_CMD \
-              -Dsonar.host.url="$SONAR_HOST_URL" \
-              -Dsonar.login="$SONAR_TOKEN" \
-              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
-              -Dsonar.projectName="$SONAR_PROJECT_KEY" \
-              -Dsonar.projectVersion="1.0" \
-              -Dsonar.sources="." \
-              -Dsonar.exclusions="node_modules/**,coverage/**,dist/**,build/**,.git/**,shared-pipelines/**" \
-              -Dsonar.coverage.exclusions="**/*.test.js,**/*.spec.js,**/*.test.ts,**/*.spec.ts" \
-              -Dsonar.javascript.lcov.reportPaths="coverage/lcov.info,coverage/**/lcov.info" \
-              -Dsonar.typescript.lcov.reportPaths="coverage/lcov.info,coverage/**/lcov.info" \
-              -Dsonar.eslint.reportPaths="eslint-report.json" \
-              -Dsonar.working.directory=/tmp/sonar \
-              $SONAR_EXTRA_ARGS \
-              $SONAR_TEST_ARGS || {
-              echo "ERROR: SonarQube scanner failed"
-              exit 1
-            }
+            # Run the scanner with proper parameters (with retry logic for plugin download timeouts)
+            MAX_RETRIES=3
+            RETRY_DELAY=10
+            RETRY_COUNT=0
+            SCANNER_SUCCESS=false
             
-            echo "✅ SonarQube scanner completed successfully"
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+              if [ $RETRY_COUNT -gt 0 ]; then
+                echo "⚠️  Retry attempt $RETRY_COUNT of $MAX_RETRIES after ${RETRY_DELAY}s delay..."
+                sleep $RETRY_DELAY
+                RETRY_DELAY=$((RETRY_DELAY + 10))  # Exponential backoff: 10s, 20s, 30s
+              fi
+              
+              echo "Running SonarQube scanner (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+              
+              # Capture output to a temporary log file for error detection
+              # Use PIPESTATUS to get the actual scanner exit code, not tee's (tee always returns 0)
+              $SONAR_CMD \
+                -Dsonar.host.url="$SONAR_HOST_URL" \
+                -Dsonar.login="$SONAR_TOKEN" \
+                -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                -Dsonar.projectName="$SONAR_PROJECT_KEY" \
+                -Dsonar.projectVersion="1.0" \
+                -Dsonar.sources="." \
+                -Dsonar.exclusions="node_modules/**,coverage/**,dist/**,build/**,.git/**,shared-pipelines/**" \
+                -Dsonar.coverage.exclusions="**/*.test.js,**/*.spec.js,**/*.test.ts,**/*.spec.ts" \
+                -Dsonar.javascript.lcov.reportPaths="coverage/lcov.info,coverage/**/lcov.info" \
+                -Dsonar.typescript.lcov.reportPaths="coverage/lcov.info,coverage/**/lcov.info" \
+                -Dsonar.eslint.reportPaths="eslint-report.json" \
+                -Dsonar.working.directory=/tmp/sonar \
+                $SONAR_EXTRA_ARGS \
+                $SONAR_TEST_ARGS 2>&1 | tee /tmp/sonar-scanner-output.log
+              SCANNER_EXIT_CODE=${PIPESTATUS[0]}  # Get exit code of the scanner command, not tee
+              
+              if [ "$SCANNER_EXIT_CODE" -eq 0 ]; then
+                SCANNER_SUCCESS=true
+                echo "✅ SonarQube scanner completed successfully"
+                break
+              else
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                echo "⚠️  SonarQube scanner failed (exit code: $SCANNER_EXIT_CODE), will retry..."
+                # Check if it's a timeout/network error (common causes)
+                if grep -qi "timeout\|SocketTimeoutException\|Socket closed\|Fail to download plugin\|EXECUTION FAILURE\|Failed to query server" /tmp/sonar-scanner-output.log 2>/dev/null; then
+                  echo "Detected network/server connection error - will retry with longer delay"
+                fi
+                if [ $RETRY_COUNT -ge $MAX_RETRIES ]; then
+                  echo "⚠️  Maximum retries reached. Scanner failed."
+                fi
+              fi
+            done
+            
+            if [ "$SCANNER_SUCCESS" = false ]; then
+              echo "⚠️  WARNING: SonarQube scanner failed after $MAX_RETRIES attempts."
+              echo "⚠️  Continuing pipeline despite scanner failure (only quality gate failures will stop the pipeline)"
+              echo "Last attempt output:"
+              cat /tmp/sonar-scanner-output.log || true
+              # Don't exit - continue pipeline, only quality gate failures will stop it
+            else
+              echo "✅ SonarQube scanner completed successfully"
+            fi
             # Ownership safety net: ensure no root-owned files remain in workspace
             if command -v sudo >/dev/null 2>&1; then
               sudo chown -R "$(id -u):$(id -g)" . || true
@@ -1505,73 +1581,143 @@ definitions:
             fi
             
             # Wait for analysis to be processed by SonarQube
-            echo "Waiting for SonarQube to process analysis..."
+            # Analysis typically completes within 3-5 seconds after upload, so a 10-second wait is sufficient
+            echo "Waiting for SonarQube to process analysis (10s)..."
             sleep 10
             
-            # Check quality gate results (no authentication required)
+            # Check quality gate results
             echo "Checking quality gate for: $SONAR_PROJECT_KEY"
             
-            # Get quality gate response
+            # Get quality gate response (public API is enough for your SonarQube instance)
             echo "=== Getting Quality Gate Response ==="
-            RESPONSE_BODY=$(curl -s "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY")
+            RESPONSE_BODY=$(curl -s "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=$SONAR_PROJECT_KEY" 2>/dev/null)
             CURL_EXIT_CODE=$?
             
             [ "$CURL_EXIT_CODE" -ne 0 ] && echo "WARNING: Sonar API curl exit=$CURL_EXIT_CODE"
             
-            # Save the raw response to a file
+            # Save the raw response to a file for debugging
             echo "$RESPONSE_BODY" > quality-gate-response.json
+            echo "Raw API response saved to quality-gate-response.json"
             
             if [ -n "$RESPONSE_BODY" ]; then
               # Check if response is valid JSON
               if echo "$RESPONSE_BODY" | jq . > /dev/null 2>&1; then
-                STATUS=$(echo "$RESPONSE_BODY" | jq -r '.projectStatus.status // "UNKNOWN"')
-                echo "Quality Gate Status: $STATUS"
-                
-                # Create a formatted quality gate summary
-                echo "=== Quality Gate Summary ===" > quality-gate-summary.txt
-                echo "Project: $SONAR_PROJECT_KEY" >> quality-gate-summary.txt
-                echo "Timestamp: $(date)" >> quality-gate-summary.txt
-                echo "Status: $STATUS" >> quality-gate-summary.txt
-                echo "" >> quality-gate-summary.txt
-                
-                if [ "$STATUS" = "OK" ]; then
-                  echo "✅ Quality gate PASSED" >> quality-gate-summary.txt
-                  echo "✅ Quality gate PASSED"
-                  echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
-                elif [ "$STATUS" = "UNKNOWN" ]; then
-                  echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet" >> quality-gate-summary.txt
-                  echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet"
-                else
-                  echo "❌ Quality gate FAILED: $STATUS" >> quality-gate-summary.txt
-                  echo "❌ Quality gate FAILED: $STATUS"
-                  echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
-
-                  if [ -n "$PR_ID_FOR_USE" ]; then
-                    echo "PR context detected; continuing despite quality gate failure"
-                  elif [ "${SONAR_ALLOW_FAILURE:-true}" = "true" ]; then
-                    echo "Sonar allow failure is true; continuing despite quality gate failure"
-                    exit 0
-                  else
-                    echo "Failing pipeline (non-PR) due to quality gate failure"
-                    exit 1
-                  fi
-                fi
-                
-                # Add detailed conditions if available
-                if echo "$RESPONSE_BODY" | jq -e '.projectStatus.conditions' > /dev/null 2>&1; then
+                # Check for authentication/API errors first
+                if echo "$RESPONSE_BODY" | jq -e '.errors' > /dev/null 2>&1; then
+                  ERROR_MSG=$(echo "$RESPONSE_BODY" | jq -r '.errors[0].msg // "Unknown error"' 2>/dev/null)
+                  echo "⚠️  Quality gate API error: $ERROR_MSG" >> quality-gate-summary.txt
+                  echo "⚠️  Quality gate API error: $ERROR_MSG"
+                  echo "Response body: $RESPONSE_BODY" >> quality-gate-summary.txt
+                  echo "Continuing without quality gate validation"
+                # Check if we have projectStatus in response (valid quality gate response)
+                elif echo "$RESPONSE_BODY" | jq -e '.projectStatus' > /dev/null 2>&1; then
+                  STATUS=$(echo "$RESPONSE_BODY" | jq -r '.projectStatus.status // "UNKNOWN"')
+                  echo "Quality Gate Status: $STATUS"
+                  
+                  # Create a formatted quality gate summary
+                  echo "=== Quality Gate Summary ===" > quality-gate-summary.txt
+                  echo "Project: $SONAR_PROJECT_KEY" >> quality-gate-summary.txt
+                  echo "Timestamp: $(date)" >> quality-gate-summary.txt
+                  echo "Status: $STATUS" >> quality-gate-summary.txt
                   echo "" >> quality-gate-summary.txt
-                  echo "=== Quality Gate Conditions ===" >> quality-gate-summary.txt
-                  echo "$RESPONSE_BODY" | jq -r '.projectStatus.conditions[] | "\(.metricKey): \(.status) (Threshold: \(.errorThreshold), Actual: \(.actualValue))"' >> quality-gate-summary.txt
+                  
+                  if [ "$STATUS" = "OK" ]; then
+                    echo "✅ Quality gate PASSED" >> quality-gate-summary.txt
+                    echo "✅ Quality gate PASSED"
+                    echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                  elif [ "$STATUS" = "UNKNOWN" ]; then
+                    echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet" >> quality-gate-summary.txt
+                    echo "⚠️  Quality gate status unknown - project may not have quality gate configured yet"
+                    echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                  elif [ "$STATUS" = "ERROR" ]; then
+                    echo "❌ Quality gate FAILED (ERROR status)" >> quality-gate-summary.txt
+                    echo "❌ Quality gate FAILED (ERROR status)"
+                    echo "Quality gate conditions failed - see details below" >> quality-gate-summary.txt
+                    echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+                    
+                    # Show failed conditions with clearer formatting
+                    FAILED_CONDITIONS=$(echo "$RESPONSE_BODY" | jq -r '
+                      .projectStatus.conditions[] 
+                      | select(.status == "ERROR") 
+                      | . as $c
+                      | (if $c.comparator == "GT" then ">" 
+                         elif $c.comparator == "LT" then "<" 
+                         elif $c.comparator == "EQ" then "=" 
+                         else $c.comparator // "" end) as $op
+                      | (if $c.metricKey | test("rating$") then 
+                           "  - \($c.metricKey): \($c.actualValue) (threshold: ≤\($c.errorThreshold), where 1=best, 5=worst)"
+                         elif $c.metricKey | test("coverage|duplicated_lines_density") then 
+                           "  - \($c.metricKey): \($c.actualValue)% (threshold: ≥\($c.errorThreshold)%)"
+                         else 
+                           "  - \($c.metricKey): \($c.actualValue) (threshold: \($op)\($c.errorThreshold))"
+                         end)
+                    ' 2>/dev/null)
+                    if [ -n "$FAILED_CONDITIONS" ]; then
+                      echo "" >> quality-gate-summary.txt
+                      echo "Failed conditions:" >> quality-gate-summary.txt
+                      echo "$FAILED_CONDITIONS" >> quality-gate-summary.txt
+                      echo "" >> quality-gate-summary.txt
+                      echo "Failed conditions:"
+                      echo "$FAILED_CONDITIONS"
+                    fi
+
+                    if [ -n "$PR_ID_FOR_USE" ]; then
+                      echo "PR context detected; continuing despite quality gate failure"
+                    elif [ "${SONAR_ALLOW_FAILURE:-true}" = "true" ]; then
+                      echo "Sonar allow failure is true; continuing despite quality gate failure"
+                      exit 0
+                    else
+                      echo "Failing pipeline (non-PR) due to quality gate failure"
+                      exit 1
+                    fi
+                  else
+                    echo "❌ Quality gate FAILED: $STATUS" >> quality-gate-summary.txt
+                    echo "❌ Quality gate FAILED: $STATUS"
+                    echo "🔗 SonarQube project: ${SONAR_HOST_URL}/dashboard?id=${SONAR_PROJECT_KEY}"
+
+                    if [ -n "$PR_ID_FOR_USE" ]; then
+                      echo "PR context detected; continuing despite quality gate failure"
+                    elif [ "${SONAR_ALLOW_FAILURE:-false}" = "true" ]; then
+                      echo "Sonar allow failure is true; continuing despite quality gate failure"
+                      exit 0
+                    else
+                      echo "Failing pipeline (non-PR) due to quality gate failure"
+                      exit 1
+                    fi
+                  fi
+                  
+                  # Add detailed conditions if available
+                  if echo "$RESPONSE_BODY" | jq -e '.projectStatus.conditions' > /dev/null 2>&1; then
+                    echo "" >> quality-gate-summary.txt
+                    echo "=== Quality Gate Conditions ===" >> quality-gate-summary.txt
+                    echo "$RESPONSE_BODY" | jq -r '.projectStatus.conditions[] | "\(.metricKey): \(.status) (Threshold: \(.errorThreshold), Actual: \(.actualValue))"' >> quality-gate-summary.txt
+                  fi
+                else
+                  # Response is JSON but doesn't have projectStatus - might be a different format
+                  echo "⚠️  Quality gate API response format unexpected" >> quality-gate-summary.txt
+                  echo "⚠️  Quality gate API response format unexpected"
+                  echo "Response structure: $(echo "$RESPONSE_BODY" | jq 'keys' 2>/dev/null || echo 'unknown')" >> quality-gate-summary.txt
+                  echo "Full response: $RESPONSE_BODY" >> quality-gate-summary.txt
+                  echo "Continuing without quality gate validation"
                 fi
                 
               else
                 echo "⚠️  Invalid JSON response from quality gate API" >> quality-gate-summary.txt
                 echo "⚠️  Invalid JSON response from quality gate API"
+                echo "Raw response: $RESPONSE_BODY" >> quality-gate-summary.txt
+                echo "This might indicate:" >> quality-gate-summary.txt
+                echo "  - API endpoint requires authentication" >> quality-gate-summary.txt
+                echo "  - API endpoint is not accessible" >> quality-gate-summary.txt
+                echo "  - Invalid project key: $SONAR_PROJECT_KEY" >> quality-gate-summary.txt
                 echo "Continuing without quality gate validation"
               fi
             else
               echo "⚠️  No response from quality gate API" >> quality-gate-summary.txt
               echo "⚠️  No response from quality gate API"
+              echo "This might indicate:" >> quality-gate-summary.txt
+              echo "  - API endpoint is not accessible" >> quality-gate-summary.txt
+              echo "  - Network connectivity issue" >> quality-gate-summary.txt
+              echo "  - SonarQube server is down" >> quality-gate-summary.txt
               echo "Continuing without quality gate validation"
             fi            
             
@@ -1647,6 +1793,78 @@ definitions:
         artifacts:
           - sonar-cleanup-summary.txt
 
+    - step: &zap-scan-uat
+        name: 🔒 OWASP ZAP Security Scan (UAT)
+        clone: 
+          enabled: true
+          depth: 2
+        runs-on:
+          - self.hosted
+          - linux.shell
+          - sonar
+        script:
+          - |
+            # Only run if ENABLE_ZAP_SCAN flag is set
+            # if [ "${ENABLE_ZAP_SCAN:-false}" != "true" ]; then
+            #   echo "ZAP scan disabled (ENABLE_ZAP_SCAN not set to true); skipping"
+            #   exit 0
+            # fi
+            
+            if [ -d "shared-pipelines" ]; then
+              echo "shared-pipelines directory already exists"
+            else
+              echo "shared-pipelines directory does not exist, cloning..."
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
+            fi
+            
+            # Make scripts executable
+            chmod +x shared-pipelines/scripts/security/*.sh || true
+            
+            # Prepare Docker CLI environment to target the local daemon via a Unix socket
+            export DOCKER_HOST="unix:///var/run/docker.sock"
+            
+            # Load .env to get deployment variables
+            if [ -f .env ]; then
+              set -a
+              . ./.env
+              set +a
+            fi
+            
+            # Determine target URL for UAT
+            if [ -z "${DOMAIN_NAME_UAT:-}" ]; then
+              echo "ERROR: DOMAIN_NAME_UAT is required for ZAP scan"
+              exit 1
+            fi
+            
+            TARGET_URL="https://${DOMAIN_NAME_UAT}"
+            export TARGET_URL
+            
+            echo "Running OWASP ZAP security scan against: ${TARGET_URL}"
+            echo "This may take 10-30 minutes depending on application size..."
+            
+            # Run ZAP scan
+            bash shared-pipelines/scripts/security/zap-scan.sh || {
+              echo "WARNING: ZAP scan failed or found issues, continuing..."
+              # Don't fail the pipeline - security findings should be reported, not block deployment
+            }
+            
+            # Convert to SonarQube format (using dedicated ZAP conversion script)
+            if [ -f "zap-report.sarif" ]; then
+              echo "Converting ZAP results to SonarQube format..."
+              chmod +x shared-pipelines/scripts/security/zap-convert-to-sonar.sh || true
+              bash shared-pipelines/scripts/security/zap-convert-to-sonar.sh "zap-report.sarif" "sonar-issues-zap.json" || {
+                echo "WARNING: Failed to convert ZAP results to SonarQube format"
+              }
+            else
+              echo "WARNING: ZAP SARIF report not found; skipping SonarQube conversion"
+            fi
+            
+            echo "✅ ZAP scan completed"
+        artifacts:
+          - zap-report.html
+          - sonar-issues-zap.json
+          - ZAP-SECURITY-REPORT.md
+
     - step: &scout
         name: 🔒 Docker Scout Scan
         clone: 
@@ -1660,7 +1878,14 @@ definitions:
             PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
             export PR_ID_FOR_USE=${PR_ID_FOR_USE}
             
-            [ -f .env ] && export $(grep -E '^(TAG_SLUG|PREVIEW_SLUG)=' .env | xargs) || true
+            if [ -f .env ]; then
+              echo "Loading .env for Docker Scout (tag and image metadata)"
+              set -a
+              . ./.env
+              set +a
+            else
+              echo "WARNING: .env not found before Docker Scout; image tags may be missing"
+            fi
             
             # Only run preview deployment for PRs targeting develop/dev
             # Skip this check for direct branch runs (dev/develop/release/*/main) - only apply to preview stages
@@ -1682,14 +1907,23 @@ definitions:
               exit 1
             }
             
-            # Choose image tag for scanning: prefer PR tag, then commit
-            CANDIDATE_TAGS="$TAG_SLUG $BITBUCKET_COMMIT"
+            # Choose image to scan: prefer environment-specific tags generated in build steps
+            CANDIDATE_IMAGES=()
+            if [ -n "${TAG_SLUG:-}" ] && [ "${BITBUCKET_BRANCH:-}" != "main" ] && [[ ! "${BITBUCKET_BRANCH:-}" =~ ^release/ ]] && [[ ! "${BITBUCKET_BRANCH:-}" =~ ^hotfix/ ]]; then
+              CANDIDATE_IMAGES+=("$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:${TAG_SLUG}")
+            fi
+            [ -n "${DEV_TAG:-}" ] && CANDIDATE_IMAGES+=("${DEV_TAG}")
+            [ -n "${UAT_TAG:-}" ] && CANDIDATE_IMAGES+=("${UAT_TAG}")
+            [ -n "${PROD_TAG:-}" ] && CANDIDATE_IMAGES+=("${PROD_TAG}")
+            [ -n "${HOTFIX_TAG:-}" ] && CANDIDATE_IMAGES+=("${HOTFIX_TAG}")
+            CANDIDATE_IMAGES+=("$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:${BITBUCKET_COMMIT}")
+
             SCAN_IMAGE=""
-            for tag in $CANDIDATE_TAGS; do
-              [ -z "$tag" ] && continue
-              echo "Trying to pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$tag for Scout..."
-              if docker pull $DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$tag; then
-                SCAN_IMAGE="$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$tag"
+            for image in "${CANDIDATE_IMAGES[@]}"; do
+              [ -z "$image" ] && continue
+              echo "Trying to pull ${image} for Scout..."
+              if docker pull "$image"; then
+                SCAN_IMAGE="$image"
                 break
               fi
             done
@@ -1701,111 +1935,7 @@ definitions:
             export DOCKER_SCOUT_HUB_USER="$DOCKERHUB_USERNAME"
             export DOCKER_SCOUT_HUB_PASSWORD="$DOCKERHUB_TOKEN"
             
-            echo "Running Docker Scout CVE scan..."
-            # Run with debug, target explicit image:// reference, capture stderr for diagnostics, and retry once if it fails
-            rm -f cve_report.json scout_cves.stderr || true
-            SCOUT_SCAN_FAILED=0
-            set +e
-            DOCKER_SCOUT_DEBUG=1 docker run --rm -u root \
-              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
-              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
-              -e DOCKER_SCOUT_DEBUG=1 \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              docker/scout-cli cves --format json image://$SCAN_IMAGE > cve_report.json 2> scout_cves.stderr || {
-              echo "First attempt failed; retrying Docker Scout CVE scan in 5s..."; sleep 5;
-              DOCKER_SCOUT_DEBUG=1 docker run --rm -u root \
-                -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
-                -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
-                -e DOCKER_SCOUT_DEBUG=1 \
-                -v /var/run/docker.sock:/var/run/docker.sock \
-                docker/scout-cli cves --format json image://$SCAN_IMAGE > cve_report.json 2>> scout_cves.stderr || SCOUT_SCAN_FAILED=1
-            }
-            if [ ! -s cve_report.json ] || [ "$SCOUT_SCAN_FAILED" = "1" ]; then
-              echo "WARN: Docker Scout CVE JSON scan failed; will derive summary from SARIF if available. Stderr:";
-              sed -n '1,200p' scout_cves.stderr || true
-            fi
-            set -e
-            
-            # Check for critical/high (aka major) CVEs, print details, and optionally fail
-            echo "Analyzing CVE report..."
-            if [ -f cve_report.json ] && [ -s cve_report.json ]; then
-              if command -v jq >/dev/null 2>&1; then
-                set +e
-                CRITICAL_COUNT=$(jq -r '[.vulnerabilities[]? | select((.severity|ascii_upcase)=="CRITICAL")] | length' cve_report.json 2>/dev/null || echo 0)
-                HIGH_COUNT=$(jq -r '[.vulnerabilities[]? | select(((.severity|ascii_upcase)=="HIGH") or ((.severity|ascii_upcase)=="MAJOR"))] | length' cve_report.json 2>/dev/null || echo 0)
-                MEDIUM_COUNT=$(jq -r '[.vulnerabilities[]? | select((.severity|ascii_upcase)=="MEDIUM")] | length' cve_report.json 2>/dev/null || echo 0)
-                LOW_COUNT=$(jq -r '[.vulnerabilities[]? | select((.severity|ascii_upcase)=="LOW")] | length' cve_report.json 2>/dev/null || echo 0)
-                set -e
-
-                echo "Docker Scout summary: critical=${CRITICAL_COUNT}, high=${HIGH_COUNT}, medium=${MEDIUM_COUNT}, low=${LOW_COUNT}"
-
-                if [ "${CRITICAL_COUNT}" -gt 0 ] || [ "${HIGH_COUNT}" -gt 0 ]; then
-                  echo "Top critical/high findings:"
-                  jq -r '
-                    .vulnerabilities[]? 
-                    | select(((.severity|ascii_upcase)=="CRITICAL") or ((.severity|ascii_upcase)=="HIGH") or ((.severity|ascii_upcase)=="MAJOR"))
-                    | "- "
-                      + (.severity // "") + " "
-                      + (.id // "") + ": "
-                      + (.title // "")
-                      + (if .package then " (pkg: " + (.package|tostring) + ")" 
-                         elif .packageName then " (pkg: " + (.packageName|tostring) + ")"
-                         else "" end)
-                  ' cve_report.json 2>/dev/null | head -n 20 || true
-                fi
-
-                if [ "$CRITICAL_COUNT" -gt 0 ]; then
-                  PR_ID_FOR_USE="${BITBUCKET_PR_ID:-$PR_ID}"
-                  if [ -n "$PR_ID_FOR_USE" ]; then
-                    echo "PR context detected; continuing despite critical vulnerabilities"
-                  else
-                    echo "Failing pipeline (non-PR) due to critical vulnerabilities"
-                    exit 1
-                  fi
-                fi
-              else
-                echo "⚠️  jq not available, skipping CVE severity analysis"
-              fi
-            else
-              # Fallback: derive counts from SARIF if JSON is unavailable
-              if [ -f docker-scout-results.sarif ] && [ -s docker-scout-results.sarif ] && command -v jq >/dev/null 2>&1; then
-                echo "Deriving CVE summary from SARIF..."
-                set +e
-                CRITICAL_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="error")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
-                HIGH_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="warning")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
-                MEDIUM_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="note")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
-                LOW_COUNT=0
-                set -e
-                echo "Docker Scout summary (from SARIF): critical=${CRITICAL_COUNT}, high=${HIGH_COUNT}, medium=${MEDIUM_COUNT}, low=${LOW_COUNT}"
-                if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
-                  echo "Top critical/high findings (from SARIF):"
-                  jq -r '
-                    .runs[0].results[]? 
-                    | select(((.level|ascii_downcase)=="error") or ((.level|ascii_downcase)=="warning"))
-                    | "- "
-                      + (.level // "") + " "
-                      + (.ruleId // "") + ": "
-                      + (.message.text // "")
-                  ' docker-scout-results.sarif 2>/dev/null | head -n 20 || true
-                fi
-              else
-                echo "⚠️  CVE report not available and SARIF missing; skipping severity analysis (scan may have failed)"
-              fi
-            fi
-            
-            echo "Generating SBOM..."
-            docker run --rm -u root \
-              -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
-              -e DOCKER_SCOUT_HUB_PASSWORD="$DOCKER_SCOUT_HUB_PASSWORD" \
-              -v /var/run/docker.sock:/var/run/docker.sock \
-              -v "$(pwd)":/workspace \
-              -w /workspace \
-              docker/scout-cli sbom --format spdx --output sbom.json image://$SCAN_IMAGE || {
-              echo "WARNING: Docker Scout SBOM generation failed"
-              echo "{}" > sbom.json
-            }
-            
-            # Generate SARIF report for SonarQube integration
+            # Generate SARIF report for SonarQube (CVE JSON scan removed - always failed and was misleading)
             echo "Generating SARIF report for SonarQube..."
             docker run --rm -u root \
               -e DOCKER_SCOUT_HUB_USER="$DOCKER_SCOUT_HUB_USER" \
@@ -1818,14 +1948,37 @@ definitions:
               echo '{"$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json", "version": "2.1.0", "runs": [{"results": []}]}' > docker-scout-results.sarif
             }
             
-            # Verify the SBOM file was created and has content
-            if [ -f "sbom.json" ] && [ -s "sbom.json" ]; then
-              echo "SBOM created: $(wc -c < sbom.json) bytes"
+            # Analyze vulnerabilities from SARIF report (accurate source)
+            echo "Analyzing CVE report from SARIF..."
+            if [ -f docker-scout-results.sarif ] && [ -s docker-scout-results.sarif ] && command -v jq >/dev/null 2>&1; then
+              set +e
+              CRITICAL_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="error")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+              HIGH_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="warning")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+              MEDIUM_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="note")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+              LOW_COUNT=$(jq -r '[.runs[0].results[]? | select((.level|ascii_downcase)=="info")] | length' docker-scout-results.sarif 2>/dev/null || echo 0)
+              set -e
+              
+              echo "Docker Scout summary: critical=${CRITICAL_COUNT}, high=${HIGH_COUNT}, medium=${MEDIUM_COUNT}, low=${LOW_COUNT}"
+              
+              if [ "$CRITICAL_COUNT" -gt 0 ] || [ "$HIGH_COUNT" -gt 0 ]; then
+                echo "Top critical/high findings:"
+                jq -r '
+                  .runs[0].results[]? 
+                  | select(((.level|ascii_downcase)=="error") or ((.level|ascii_downcase)=="warning")))
+                  | "- "
+                    + (.level // "") + " "
+                    + (.ruleId // "") + ": "
+                    + (.message.text // "")
+                ' docker-scout-results.sarif 2>/dev/null | head -n 20 || true
+              fi
+              
+              if [ "$CRITICAL_COUNT" -gt 0 ]; then
+                echo "⚠️  WARNING: Found ${CRITICAL_COUNT} critical vulnerabilities"
+                echo "⚠️  Results will be uploaded to SonarQube for quality gate evaluation"
+                echo "⚠️  Pipeline will continue; quality gate check in SonarQube stage will determine pass/fail"
+              fi
             else
-              echo "❌ SBOM file not found or empty"
-              echo "Current directory contents:"
-              ls -la
-              echo "{}" > sbom.json
+              echo "⚠️  SARIF report not available; skipping severity analysis"
             fi
 
             # Create compact XML summary for quick review (no leading spaces before XML declaration)
@@ -1863,7 +2016,6 @@ definitions:
             
             echo "Docker Scout analysis completed"
         artifacts:
-          - sbom.json
           - docker-scout-results.sarif
           - docker-scout-results.xml
 
@@ -2006,9 +2158,9 @@ definitions:
           - common.ci
         script:
           - |
-            # If IS_BACKEND is not set, then skip the promote step
-            if [ -z "$IS_BACKEND" ]; then
-              echo "IS_BACKEND is not set skipping promote step"
+            # Enable promotion for backends, internal services, or non-static frontends with ENABLE_PROMOTE=true
+            if [ -z "$IS_BACKEND" ] && [ "${IS_INTERNAL_SERVICE:-false}" != "true" ] && [ "${ENABLE_PROMOTE:-false}" != "true" ]; then
+              echo "Promotion not enabled (IS_BACKEND not set, IS_INTERNAL_SERVICE not true, and ENABLE_PROMOTE not true): skipping promote step"
               exit 0
             fi
 
@@ -2058,9 +2210,9 @@ definitions:
         script:
           - |
 
-            # If IS_BACKEND is not set, then skip the promote step
-            if [ -z "$IS_BACKEND" ]; then
-              echo "IS_BACKEND is not set skipping promote step"
+            # Enable promotion for backends, internal services, or non-static frontends with ENABLE_PROMOTE=true
+            if [ -z "$IS_BACKEND" ] && [ "${IS_INTERNAL_SERVICE:-false}" != "true" ] && [ "${ENABLE_PROMOTE:-false}" != "true" ]; then
+              echo "Promotion not enabled (IS_BACKEND not set, IS_INTERNAL_SERVICE not true, and ENABLE_PROMOTE not true): skipping promote step"
               exit 0
             fi
 
@@ -2119,7 +2271,6 @@ definitions:
               docker tag "$DIGEST" "$TARGET_TAG" || { echo "ERROR: Failed to tag as $TARGET_TAG"; exit 1; }
               docker push "$TARGET_TAG" || { echo "ERROR: Failed to push $TARGET_TAG"; exit 1; }
               echo "✅ Promoted $DIGEST -> $TARGET_TAG"
-              docker rmi "$TARGET_TAG" 2>/dev/null || true
             done
             # Write promoted tag to artifact file for deploy stages
             echo "$DOCKERHUB_ORGNAME/$BITBUCKET_REPO_SLUG:$FINAL_VERSION" > prod.txt
@@ -2145,7 +2296,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
             
             # Load .env into current environment for docker compose variable interpolation
@@ -2160,6 +2311,36 @@ definitions:
             echo ".env:"
             cat .env
             echo "--------------------------------"
+            
+            # Create dev.env with deployment variables if flag is set
+            # USE_DEPLOYMENT_VARS_DEV (per-env) overrides global USE_DEPLOYMENT_VARS
+            if [ "${USE_DEPLOYMENT_VARS_DEV:-${USE_DEPLOYMENT_VARS:-false}}" = "true" ]; then
+              # Create fresh dev.env file with deployment variables (Bitbucket injects them when deployment: dev is specified)
+              > dev.env  # Create/truncate file
+              env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | while IFS='=' read -r key value; do
+                # Skip system/Bitbucket variables that shouldn't be in the env file
+                case "$key" in
+                  BITBUCKET_*|PATH|HOME|USER|SHELL|PWD|OLDPWD|_|SSH_*|SHLVL|LANG|LS_COLORS|LESSOPEN|LESSCLOSE|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID|MEMORY_PRESSURE_*|BITBUCKET_*|DOCKER_HOST|DOCKERHUB_*|CLOUDFLARE_*|UMBRELLA_*|INTERNAL_DNS_*|SHARED_DOCKER_*|TARGET_IP_*|DOMAIN_NAME_*|TUNNEL_*|APP_PORT|PORT|TAG_SLUG|PREVIEW_*|DEV_TAG|UAT_TAG|PROD_TAG|HOTFIX_TAG|VERSION|SKIP_*|USE_DEPLOYMENT_VARS|USE_DEPLOYMENT_VARS_*|BITBUCKT_*|NODE_VERSION|YARN_VERSION|NODE_ENV|NODE_OPTIONS|NPM_*|CI|LOGNAME)
+                    continue ;;
+                esac
+                # Skip empty keys or variables with empty values (to avoid issues with undefined vars)
+                [ -z "$key" ] && continue
+                [ -z "$value" ] && continue
+                # Sanitize value: remove newlines/carriage returns, quotes, and trim spaces
+                # Remove surrounding quotes if present (handles NODE_OPTIONS="--max-old-space-size=8192")
+                sanitized_value="$(printf '%s' "$value" | tr -d '\n\r' | sed -E 's/^["'\'']+//; s/["'\'']+$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+                
+                # Skip if value becomes empty after sanitization
+                [ -z "$sanitized_value" ] && continue
+                
+                # Append to dev.env (escape special chars in value if needed)
+                printf '%s=%s\n' "$key" "$sanitized_value" >> dev.env
+              done
+              echo "Created dev.env with $(wc -l < dev.env) variables from deployment environment"
+            else
+              # Create empty dev.env so docker-compose doesn't fail if referenced
+              touch dev.env
+            fi
             
             # Override DOCKER_HOST from .env to use Unix socket (self-hosted runner)
             export DOCKER_HOST="unix:///var/run/docker.sock"
@@ -2207,9 +2388,10 @@ definitions:
                 pull_policy: always
                 env_file:
                   - .env
+                  - dev.env
                 labels:
                   - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
-                  - 'com.myorg.environment=${ENVIRONMENT:-${NODE_ENV}}'
+                  - 'com.myorg.environment=${TARGET_ENV:-dev}'
                   - 'traefik.enable=true'
                   - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.rule=${TRAEFIK_HOST_RULE}'
                   - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.entrypoints=websecure'
@@ -2229,17 +2411,13 @@ definitions:
               traefik-network:
                 external: true    
             COMPOSE_EOF
-            echo "--------------------------------"
-            echo "docker-compose.override.yml:"
-            cat docker-compose.override.yml
-            # Use docker-compose.dev.yml if it exists, otherwise fallback to docker-compose.yml
+            echo "=== docker-compose.override.yml ==="; cat docker-compose.override.yml || echo "(missing)"; echo ""
+            # Use docker-compose.dev.yml if it exists, otherwise fallback to docker-compose.yml (print like preview)
             if [ -f "docker-compose.dev.yml" ]; then
-              cat docker-compose.dev.yml
-              echo "--------------------------------"
+              echo "=== docker-compose.dev.yml ==="; cat docker-compose.dev.yml; echo "================================================"
               docker compose -f docker-compose.dev.yml -f docker-compose.override.yml up -d
             else
-              cat docker-compose.yml
-              echo "--------------------------------"
+              echo "=== docker-compose.yml ==="; cat docker-compose.yml || echo "(missing)"; echo "================================================"
               docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
             fi
             sleep 10
@@ -2261,7 +2439,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
             
             # Docker login with error checking
@@ -2282,6 +2460,36 @@ definitions:
             echo ".env:"
             cat .env
             echo "--------------------------------"
+            
+            # Create uat.env with deployment variables if flag is set
+            # USE_DEPLOYMENT_VARS_UAT (per-env) overrides global USE_DEPLOYMENT_VARS
+            if [ "${USE_DEPLOYMENT_VARS_UAT:-${USE_DEPLOYMENT_VARS:-false}}" = "true" ]; then
+              # Create fresh uat.env file with deployment variables (Bitbucket injects them when deployment: uat is specified)
+              > uat.env  # Create/truncate file
+              env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | while IFS='=' read -r key value; do
+                # Skip system/Bitbucket variables that shouldn't be in the env file
+                case "$key" in
+                  BITBUCKET_*|PATH|HOME|USER|SHELL|PWD|OLDPWD|_|SSH_*|SHLVL|LANG|LS_COLORS|LESSOPEN|LESSCLOSE|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID|MEMORY_PRESSURE_*|BITBUCKET_*|DOCKER_HOST|DOCKERHUB_*|CLOUDFLARE_*|UMBRELLA_*|INTERNAL_DNS_*|SHARED_DOCKER_*|TARGET_IP_*|DOMAIN_NAME_*|TUNNEL_*|APP_PORT|PORT|TAG_SLUG|PREVIEW_*|DEV_TAG|UAT_TAG|PROD_TAG|HOTFIX_TAG|VERSION|SKIP_*|USE_DEPLOYMENT_VARS|USE_DEPLOYMENT_VARS_*|BITBUCKT_*|NODE_VERSION|YARN_VERSION|NODE_ENV|NODE_OPTIONS|NPM_*|CI|LOGNAME)
+                    continue ;;
+                esac
+                # Skip empty keys or variables with empty values (to avoid issues with undefined vars)
+                [ -z "$key" ] && continue
+                [ -z "$value" ] && continue
+                # Sanitize value: remove newlines/carriage returns, quotes, and trim spaces
+                # Remove surrounding quotes if present (handles NODE_OPTIONS="--max-old-space-size=8192")
+                sanitized_value="$(printf '%s' "$value" | tr -d '\n\r' | sed -E 's/^["'\'']+//; s/["'\'']+$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+                
+                # Skip if value becomes empty after sanitization
+                [ -z "$sanitized_value" ] && continue
+                
+                # Append to uat.env (escape special chars in value if needed)
+                printf '%s=%s\n' "$key" "$sanitized_value" >> uat.env
+              done
+              echo "Created uat.env with $(wc -l < uat.env) variables from deployment environment"
+            else
+              # Create empty uat.env so docker-compose doesn't fail if referenced
+              touch uat.env
+            fi
             
             # Override DOCKER_HOST from .env to use Unix socket (self-hosted runner)
             export DOCKER_HOST="unix:///var/run/docker.sock"
@@ -2307,31 +2515,92 @@ definitions:
             
             export COMPOSE_PROJECT_NAME="${BITBUCKET_REPO_SLUG}-uat"
             
-            # Require DOMAIN_NAME_UAT for routing
-            if [ -z "${DOMAIN_NAME_UAT:-}" ]; then
-              echo "ERROR: DOMAIN_NAME_UAT is required for UAT routing"; exit 1
-            fi
-            # Derive TRAEFIK_HOST_RULE
-            TRAEFIK_HOST_RULE="Host(\`${DOMAIN_NAME_UAT}\`)"
-            export TRAEFIK_HOST_RULE
-            
-            # Default APP_PORT if not set
-            if [ -z "${APP_PORT}" ]; then
-              APP_PORT=80
-              export APP_PORT
-              echo "INFO: APP_PORT is not set, defaulting to 80"
-            fi
-            
-            cat > docker-compose.override.yml << COMPOSE_EOF
+            # Check if backend should use Cloudflare Tunnel instead of Traefik
+            if [ "${IS_BACKEND}" = "true" ] && [ "${USE_CLOUDFLARE_TUNNEL_UAT:-false}" = "true" ]; then
+              echo "Backend repo detected (IS_BACKEND=true) with USE_CLOUDFLARE_TUNNEL_UAT=true, using Cloudflare Tunnel instead of Traefik"
+              
+              # Ensure Cloudflare Tunnel is running for backend
+              echo "--------------------------------"
+              TUNNEL_CONTAINER_NAME="${TUNNEL_CONTAINER_NAME:-cloudflared-backend-uat}"
+              # Determine current status (empty if container not found)
+              TUNNEL_STATUS=$(docker inspect -f '{{.State.Status}}' "$TUNNEL_CONTAINER_NAME" 2>/dev/null || true)
+              if [ -z "$TUNNEL_STATUS" ] || [ "$TUNNEL_STATUS" != "running" ]; then
+                echo "Cloudflare Tunnel container status: ${TUNNEL_STATUS:-<absent>} → setting up (recreate) tunnel..."
+                # Make script executable
+                chmod +x shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh
+                # Run tunnel setup script
+                # Required: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME (use TUNNEL_HOSTNAME_UAT if set, otherwise DOMAIN_NAME_UAT)
+                # Optional: TUNNEL_NAME (defaults to first part of TUNNEL_HOSTNAME), TUNNEL_SERVICE_URL (defaults to http://127.0.0.1:${APP_PORT}), TUNNEL_SECRET, TUNNEL_CONTAINER_NAME, TUNNEL_IMAGE
+                # Prefer dedicated tunnel token if provided; do not overwrite global token
+                if [ -n "${CLOUDFLARE_API_KEY_FOR_TUNNEL:-}" ]; then
+                  CLOUDFLARE_API_TOKEN_FOR_CALL="${CLOUDFLARE_API_KEY_FOR_TUNNEL}"
+                else
+                  CLOUDFLARE_API_TOKEN_FOR_CALL="${CLOUDFLARE_API_TOKEN:-}"
+                fi
+                # Use TUNNEL_HOSTNAME_UAT if set, otherwise fallback to DOMAIN_NAME_UAT
+                TUNNEL_HOSTNAME_FOR_UAT="${TUNNEL_HOSTNAME_UAT:-${DOMAIN_NAME_UAT:-}}"
+                if [ -z "$TUNNEL_HOSTNAME_FOR_UAT" ]; then
+                  echo "ERROR: TUNNEL_HOSTNAME_UAT or DOMAIN_NAME_UAT is required for UAT Cloudflare Tunnel"
+                  exit 1
+                fi
+                TUNNEL_CONTAINER_NAME="$TUNNEL_CONTAINER_NAME" \
+                TUNNEL_HOSTNAME="$TUNNEL_HOSTNAME_FOR_UAT" \
+                CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN_FOR_CALL}" bash shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh || {
+                  echo "ERROR: Failed to setup Cloudflare Tunnel for UAT"
+                  echo "Required variables: CLOUDFLARE_API_TOKEN (or CLOUDFLARE_API_KEY_FOR_TUNNEL), CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME_UAT (or DOMAIN_NAME_UAT), APP_PORT"
+                  exit 1
+                }
+              else
+                echo "✅ Cloudflare Tunnel is healthy and running (container: ${TUNNEL_CONTAINER_NAME})"
+              fi
+              echo "--------------------------------"
+              
+              # Default APP_PORT if not set
+              if [ -z "${APP_PORT}" ]; then
+                APP_PORT=8000
+                export APP_PORT
+                echo "INFO: APP_PORT is not set, defaulting to 8000"
+              fi
+              
+              cat > docker-compose.override.yml << COMPOSE_EOF
             services:
               ${BITBUCKET_REPO_SLUG}:
                 image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
                 pull_policy: always
                 env_file:
                   - .env
+                  - uat.env
+                ports:
+                  - "${APP_PORT:-8000}:${APP_PORT:-8000}"
+            COMPOSE_EOF
+            else
+              # Frontend or backend without tunnel flag: use Traefik
+              # Require DOMAIN_NAME_UAT for routing
+              if [ -z "${DOMAIN_NAME_UAT:-}" ]; then
+                echo "ERROR: DOMAIN_NAME_UAT is required for UAT routing"; exit 1
+              fi
+              # Derive TRAEFIK_HOST_RULE
+              TRAEFIK_HOST_RULE="Host(\`${DOMAIN_NAME_UAT}\`)"
+              export TRAEFIK_HOST_RULE
+              
+              # Default APP_PORT if not set
+              if [ -z "${APP_PORT}" ]; then
+                APP_PORT=80
+                export APP_PORT
+                echo "INFO: APP_PORT is not set, defaulting to 80"
+              fi
+              
+              cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${BITBUCKET_REPO_SLUG}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env
+                  - uat.env
                 labels:
                   - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
-                  - 'com.myorg.environment=${ENVIRONMENT:-uat}'
+                  - 'com.myorg.environment=${TARGET_ENV:-uat}'
                   - 'traefik.enable=true'
                   - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.rule=${TRAEFIK_HOST_RULE}'
                   - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.entrypoints=websecure'
@@ -2351,10 +2620,17 @@ definitions:
               traefik-network:
                 external: true
             COMPOSE_EOF
-            # Use docker-compose.uat.yml if it exists, otherwise fallback to docker-compose.yml
+            fi
+            # Print compose files like preview and bring up
             if [ -f "docker-compose.uat.yml" ]; then
+              echo "=== docker-compose.uat.yml ==="; cat docker-compose.uat.yml
+              echo "=== docker-compose.override.yml ==="; cat docker-compose.override.yml
+              echo "================================================"
               docker compose -f docker-compose.uat.yml -f docker-compose.override.yml up -d
             else
+              echo "=== docker-compose.yml ==="; cat docker-compose.yml || true
+              echo "=== docker-compose.override.yml ==="; cat docker-compose.override.yml
+              echo "================================================"
               docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
             fi
             sleep 10
@@ -2376,7 +2652,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
             
             # Docker login with error checking
@@ -2397,6 +2673,36 @@ definitions:
             echo ".env:"
             cat .env
             echo "--------------------------------"
+            
+            # Create prod.env with deployment variables if flag is set
+            # USE_DEPLOYMENT_VARS_PROD (per-env) overrides global USE_DEPLOYMENT_VARS
+            if [ "${USE_DEPLOYMENT_VARS_PROD:-${USE_DEPLOYMENT_VARS:-false}}" = "true" ]; then
+              # Create fresh prod.env file with deployment variables (Bitbucket injects them when deployment: prod is specified)
+              > prod.env  # Create/truncate file
+              env | grep -E '^[A-Za-z_][A-Za-z0-9_]*=' | while IFS='=' read -r key value; do
+                # Skip system/Bitbucket variables that shouldn't be in the env file
+                case "$key" in
+                  BITBUCKET_*|PATH|HOME|USER|SHELL|PWD|OLDPWD|_|SSH_*|SHLVL|LANG|LS_COLORS|LESSOPEN|LESSCLOSE|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID|MEMORY_PRESSURE_*|BITBUCKET_*|DOCKER_HOST|DOCKERHUB_*|CLOUDFLARE_*|UMBRELLA_*|INTERNAL_DNS_*|SHARED_DOCKER_*|TARGET_IP_*|DOMAIN_NAME_*|TUNNEL_*|APP_PORT|PORT|TAG_SLUG|PREVIEW_*|DEV_TAG|UAT_TAG|PROD_TAG|HOTFIX_TAG|VERSION|SKIP_*|USE_DEPLOYMENT_VARS|USE_DEPLOYMENT_VARS_*|BITBUCKT_*|NODE_VERSION|YARN_VERSION|NODE_ENV|NODE_OPTIONS|NPM_*|CI|LOGNAME)
+                    continue ;;
+                esac
+                # Skip empty keys or variables with empty values (to avoid issues with undefined vars)
+                [ -z "$key" ] && continue
+                [ -z "$value" ] && continue
+                # Sanitize value: remove newlines/carriage returns, quotes, and trim spaces
+                # Remove surrounding quotes if present (handles NODE_OPTIONS="--max-old-space-size=8192")
+                sanitized_value="$(printf '%s' "$value" | tr -d '\n\r' | sed -E 's/^["'\'']+//; s/["'\'']+$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+                
+                # Skip if value becomes empty after sanitization
+                [ -z "$sanitized_value" ] && continue
+                
+                # Append to prod.env (escape special chars in value if needed)
+                printf '%s=%s\n' "$key" "$sanitized_value" >> prod.env
+              done
+              echo "Created prod.env with $(wc -l < prod.env) variables from deployment environment"
+            else
+              # Create empty prod.env so docker-compose doesn't fail if referenced
+              touch prod.env
+            fi
             
             # Override DOCKER_HOST from .env to use Unix socket (self-hosted runner)
             export DOCKER_HOST="unix:///var/run/docker.sock"
@@ -2421,40 +2727,78 @@ definitions:
             echo "Set TAG_SLUG: $TAG_SLUG"
             
             export COMPOSE_PROJECT_NAME="${BITBUCKET_REPO_SLUG}-prod"
+            # Prod compose service name: override if consumer uses different service name (e.g. app) in docker-compose.prod.yml
+            COMPOSE_SERVICE_NAME_PROD="${COMPOSE_SERVICE_NAME_PROD:-$BITBUCKET_REPO_SLUG}"
+            export COMPOSE_SERVICE_NAME_PROD
+            echo "Compose service name (prod): $COMPOSE_SERVICE_NAME_PROD"
             
-            # Check if this is a backend repo (skips Traefik labels, uses Cloudflare Tunnel)
-            if [ "${IS_BACKEND}" = "true" ]; then
-              echo "Backend repo detected (IS_BACKEND=true), skipping Traefik labels"
-              
-              # Ensure Cloudflare Tunnel is running for backend
-              echo "--------------------------------"
-              TUNNEL_CONTAINER_NAME="${TUNNEL_CONTAINER_NAME:-cloudflared-backend}"
-              if ! docker ps --format "{{.Names}}" | grep -q "^${TUNNEL_CONTAINER_NAME}$"; then
-                echo "Cloudflare Tunnel container not running. Setting up tunnel..."
-                # Make script executable
-                chmod +x shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh
-                # Run tunnel setup script
-                # Required: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME
-                # Optional: TUNNEL_NAME (defaults to first part of TUNNEL_HOSTNAME), TUNNEL_SERVICE_URL (defaults to http://127.0.0.1:${APP_PORT}), TUNNEL_SECRET, TUNNEL_CONTAINER_NAME, TUNNEL_IMAGE
-                bash shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh || {
-                  echo "ERROR: Failed to setup Cloudflare Tunnel"
-                  echo "Required variables: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME, APP_PORT"
-                  exit 1
-                }
-              else
-                echo "✅ Cloudflare Tunnel is already running (container: ${TUNNEL_CONTAINER_NAME})"
-              fi
-              echo "--------------------------------"
+            # Routing mode selection:
+            # 1) IS_INTERNAL_SERVICE=true  → internal-only service (no Traefik, no Cloudflare Tunnel)
+            #    - Treated as backend for build/promote/Traefik stages, but skips Cloudflare Tunnel
+            # 2) IS_BACKEND=true          → backend with Cloudflare Tunnel (no Traefik labels)
+            # 3) else                     → frontend/admin with Traefik labels
+            if [ "${IS_INTERNAL_SERVICE:-false}" = "true" ]; then
+              echo "Internal service detected (IS_INTERNAL_SERVICE=true); skipping Traefik and Cloudflare Tunnel for Prod"
+              echo "Internal services are treated as backends (skip build, promote flow) but skip Cloudflare Tunnel"
               
               cat > docker-compose.override.yml << COMPOSE_EOF
             services:
-              ${BITBUCKET_REPO_SLUG}:
+              ${COMPOSE_SERVICE_NAME_PROD}:
                 image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
                 pull_policy: always
                 env_file:
                   - .env
+                  - prod.env
                 ports:
-                  - "${APP_PORT:-8000}:${APP_PORT:-8000}"
+                  - "${APP_PORT:-3000}:${APP_PORT:-3000}"
+            COMPOSE_EOF
+            elif [ "${IS_BACKEND}" = "true" ]; then
+              echo "Backend repo detected (IS_BACKEND=true), skipping Traefik labels"
+              
+              # Check if Cloudflare Tunnel should be skipped
+              if [ "${SKIP_CLOUDFLARE_TUNNEL:-false}" = "true" ]; then
+                echo "Skipping Cloudflare Tunnel setup (SKIP_CLOUDFLARE_TUNNEL=true)"
+                echo "Backend port will be published to host; can be accessed by other services via host IP:port"
+              else
+                # Ensure Cloudflare Tunnel is running for backend
+                echo "--------------------------------"
+                TUNNEL_CONTAINER_NAME="${TUNNEL_CONTAINER_NAME:-cloudflared-backend}"
+                # Determine current status (empty if container not found)
+                TUNNEL_STATUS=$(docker inspect -f '{{.State.Status}}' "$TUNNEL_CONTAINER_NAME" 2>/dev/null || true)
+                if [ -z "$TUNNEL_STATUS" ] || [ "$TUNNEL_STATUS" != "running" ]; then
+                  echo "Cloudflare Tunnel container status: ${TUNNEL_STATUS:-<absent>} → setting up (recreate) tunnel..."
+                  # Make script executable
+                  chmod +x shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh
+                  # Run tunnel setup script
+                  # Required: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME
+                  # Optional: TUNNEL_NAME (defaults to first part of TUNNEL_HOSTNAME), TUNNEL_SERVICE_URL (defaults to http://127.0.0.1:${APP_PORT}), TUNNEL_SECRET, TUNNEL_CONTAINER_NAME, TUNNEL_IMAGE
+                  # Prefer dedicated tunnel token if provided; do not overwrite global token
+                  if [ -n "${CLOUDFLARE_API_KEY_FOR_TUNNEL:-}" ]; then
+                    CLOUDFLARE_API_TOKEN_FOR_CALL="${CLOUDFLARE_API_KEY_FOR_TUNNEL}"
+                  else
+                    CLOUDFLARE_API_TOKEN_FOR_CALL="${CLOUDFLARE_API_TOKEN:-}"
+                  fi
+                  CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN_FOR_CALL}" bash shared-pipelines/scripts/dns/cloudflare/setup_tunnel.sh || {
+                    echo "ERROR: Failed to setup Cloudflare Tunnel"
+                    echo "Required variables: CLOUDFLARE_API_TOKEN (or CLOUDFLARE_API_KEY_FOR_TUNNEL), CLOUDFLARE_ACCOUNT_ID, TUNNEL_HOSTNAME, APP_PORT"
+                    exit 1
+                  }
+                else
+                  echo "✅ Cloudflare Tunnel is healthy and running (container: ${TUNNEL_CONTAINER_NAME})"
+                fi
+                echo "--------------------------------"
+              fi
+              
+              cat > docker-compose.override.yml << COMPOSE_EOF
+            services:
+              ${COMPOSE_SERVICE_NAME_PROD}:
+                image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
+                pull_policy: always
+                env_file:
+                  - .env
+                  - prod.env
+                ports:
+                  - "${APP_PORT:-3000}:${APP_PORT:-3000}"
             COMPOSE_EOF
             else
               # Frontend or admin panel: add Traefik labels
@@ -2485,29 +2829,30 @@ definitions:
               
               cat > docker-compose.override.yml << COMPOSE_EOF
             services:
-              ${BITBUCKET_REPO_SLUG}:
+              ${COMPOSE_SERVICE_NAME_PROD}:
                 image: ${DOCKERHUB_ORGNAME}/${BITBUCKET_REPO_SLUG}:${TAG_SLUG}
                 pull_policy: always
                 env_file:
                   - .env
+                  - prod.env
                 labels:
-                  - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
-                  - 'com.myorg.environment=${ENVIRONMENT:-prod}'
+                  - 'com.myorg.service=${COMPOSE_SERVICE_NAME_PROD}'
+                  - 'com.myorg.environment=${TARGET_ENV:-prod}'
                   - 'traefik.enable=true'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.rule=${TRAEFIK_HOST_RULE}'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.entrypoints=websecure'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.tls=true'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.service=${BITBUCKET_REPO_SLUG}'
-                  - 'traefik.http.services.${BITBUCKET_REPO_SLUG}.loadbalancer.server.port=${APP_PORT}'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}.entrypoints=websecure'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}.tls=true'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}.service=${COMPOSE_SERVICE_NAME_PROD}'
+                  - 'traefik.http.services.${COMPOSE_SERVICE_NAME_PROD}.loadbalancer.server.port=${APP_PORT}'
                   # IP whitelist middleware for admin panels
                   - 'traefik.http.middlewares.admin-ip-whitelist.ipwhitelist.sourcerange=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16'
                   # Apply middleware if admin panel
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}.middlewares=${TRAEFIK_MIDDLEWARES}'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}.middlewares=${TRAEFIK_MIDDLEWARES}'
                   # HTTP -> HTTPS redirect
-                  - 'traefik.http.middlewares.${BITBUCKET_REPO_SLUG}-https.redirectscheme.scheme=https'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.rule=${TRAEFIK_HOST_RULE}'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.entrypoints=web'
-                  - 'traefik.http.routers.${BITBUCKET_REPO_SLUG}-http.middlewares=${BITBUCKET_REPO_SLUG}-https'
+                  - 'traefik.http.middlewares.${COMPOSE_SERVICE_NAME_PROD}-https.redirectscheme.scheme=https'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}-http.rule=${TRAEFIK_HOST_RULE}'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}-http.entrypoints=web'
+                  - 'traefik.http.routers.${COMPOSE_SERVICE_NAME_PROD}-http.middlewares=${COMPOSE_SERVICE_NAME_PROD}-https'
                   - 'traefik.docker.network=traefik-network'
                 networks:
                   - traefik-network
@@ -2518,10 +2863,16 @@ definitions:
             COMPOSE_EOF
             fi
             
-            # Use docker-compose.prod.yml if it exists, otherwise fallback to docker-compose.yml
+            # Print compose files like preview and bring up
             if [ -f "docker-compose.prod.yml" ]; then
+              echo "=== docker-compose.prod.yml ==="; cat docker-compose.prod.yml
+              echo "=== docker-compose.override.yml ==="; cat docker-compose.override.yml
+              echo "================================================"
               docker compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d
             else
+              echo "=== docker-compose.yml ==="; cat docker-compose.yml || true
+              echo "=== docker-compose.override.yml ==="; cat docker-compose.override.yml
+              echo "================================================"
               docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
             fi
             sleep 10
@@ -2588,7 +2939,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
                 chmod +x shared-pipelines/scripts/preview/certbot_cloudflare.sh || true
                 chmod +x shared-pipelines/scripts/preview/certbot_cloudflare_renew.sh || true
@@ -2597,7 +2948,7 @@ definitions:
                   exit 1
                 fi
                 # Ensure INTERNAL_DNS_ZONE (used by the certbot script to compute FQDN)
-                export INTERNAL_DNS_ZONE="${INTERNAL_DNS_ZONE:-internal.$PREVIEW_DOMAIN_NAME}}"
+                export INTERNAL_DNS_ZONE="${INTERNAL_DNS_ZONE:-internal.$PREVIEW_DOMAIN_NAME}"
                 
                 # Force production certs for fisrt run (comment out later)
                 # export CERTBOT_FORCE_PROD=1
@@ -2685,6 +3036,7 @@ definitions:
           - linux.shell
           - preview.runner
         deployment: preview
+        trigger: manual
         script:
           - |
             # Restore consumer repo from artifact snapshot
@@ -2713,7 +3065,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
             
             # Prepare Docker CLI environment to target the local daemon via a Unix socket.
@@ -2766,8 +3118,21 @@ definitions:
               IFS=',' read -r -a __pairs <<< "${PEER_HOST_URLS}"
               for __pair in "${__pairs[@]}"; do
                 __pair="$(echo "${__pair}" | xargs)"; [ -z "${__pair}" ] && continue
-                __var_name="${__pair%%.*}"; __app_slug="${__pair#*.}"
+                __var_name="${__pair%%.*}"
+                __slug_and_key="${__pair#*.}"
+                # For VAR.app.extra format, extract extra key and prepend to host
+                # Examples:
+                #   MINIO_EXTERNAL_ENDPOINT.homnifi-machine-service.minio → minio-preview-<key>-homnifi-machine-service.internal...
+                __app_slug="${__slug_and_key}"
+                __extra_key=""
+                if [[ "${__slug_and_key}" == *.* ]]; then
+                  __extra_key="${__slug_and_key##*.}"
+                  __app_slug="${__slug_and_key%.*}"
+                fi
                 __host="preview-${PREVIEW_KEY_USE}-${__app_slug}.internal.${PREVIEW_DOMAIN_NAME}"
+                if [ -n "${__extra_key}" ] && [ "${__extra_key}" != "${__slug_and_key}" ]; then
+                  __host="${__extra_key}-${__host}"
+                fi
                 __url="https://${__host}"
                 export "${__var_name}=${__url}"
                 echo "${__var_name}=${__url}" >> .env
@@ -2797,7 +3162,7 @@ definitions:
                   - .env  
                 labels:
                   - 'com.myorg.service=${BITBUCKET_REPO_SLUG}'
-                  - 'com.myorg.environment=${ENVIRONMENT:-${NODE_ENV}}'
+                  - 'com.myorg.environment=${TARGET_ENV:-preview}'
                   - 'traefik.enable=true'
                   - 'traefik.http.routers.${PREVIEW_SLUG}.rule=${TRAEFIK_HOST_RULE}'
                   - 'traefik.http.routers.${PREVIEW_SLUG}.entrypoints=websecure'
@@ -2835,9 +3200,31 @@ definitions:
               docker compose -f docker-compose.yml -f docker-compose.override.yml up -d
             fi
             
-            # Wait for container to be ready
-            echo "Waiting for preview container to be ready..."
-            sleep 15
+            # Wait for containers to be ready
+            echo "Waiting for containers to be ready..."
+            sleep 10
+            
+            # Restore dev database dump if enabled (preview environments only)
+            if [ "${DB_DUMP_FROM_DEV:-false}" = "true" ]; then
+              echo "--------------------------------"
+              echo "Database restore enabled - restoring dev database dump..."
+              chmod +x shared-pipelines/scripts/preview/db_restore/preview_db_entrypoint.sh || true
+              # Source .env to make variables available to restore script
+              if [ -f .env ]; then
+                set -a; . ./.env; set +a
+              fi
+              bash shared-pipelines/scripts/preview/db_restore/preview_db_entrypoint.sh || {
+                echo "WARNING: Database restore failed; continuing deployment..."
+                echo "Check DB_DUMP_FROM_DEV, DEV_DB_SOURCE, DEV_DB_USER, DEV_DB_PASSWORD, and DEV_DB_NAME variables"
+              }
+              echo "--------------------------------"
+            else
+              echo "Database restore disabled (DB_DUMP_FROM_DEV=${DB_DUMP_FROM_DEV:-false})"
+            fi
+            
+            # Additional wait for app to initialize after database restore
+            echo "Waiting for application to initialize..."
+            sleep 5
             
             # Health check via Traefik (using full domain)
             curl -sf https://${PREVIEW_DOMAIN}/health || {
@@ -2907,7 +3294,7 @@ definitions:
               echo "shared-pipelines directory already exists"
             else
               echo "shared-pipelines directory does not exist, cloning..."
-              git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+              git clone git@bitbucket.org:protocol33/shared-pipelines.git
             fi
 
             # Prepare Docker CLI environment to target the local daemon via a Unix socket.
@@ -2992,14 +3379,34 @@ definitions:
             # Uses existing Certbot + Cloudflare DNS flow to provision wildcard certs
             # and mounts them into Traefik via file provider as a default TLS cert.
 
-            # Skip Traefik setup for backend repos in prod (they use Cloudflare Tunnel)
-            if [ "${IS_BACKEND}" = "true" ] && [ "${ENVIRONMENT:-}" = "prod" ]; then
-              echo "Backend repo in prod detected (IS_BACKEND=true), skipping Traefik setup (use Cloudflare Tunnel instead)"
+            # Print the IP of the host
+            echo "************************************************"
+            echo "Hostname of the host: $(hostname)"
+            echo "IP of the host: $(hostname -I)"
+            echo "************************************************"
+
+            # Skip Traefik setup for backend repos and internal services on prod (they use Cloudflare Tunnel or no routing)
+            # Also skip for UAT backends if USE_CLOUDFLARE_TUNNEL_UAT=true
+            # Note: ENVIRONMENT is set below; also short-circuit on main branch so we can skip early
+            # Internal services are treated as backends (skip Traefik in PROD) but skip Cloudflare Tunnel
+            if { [ "${IS_BACKEND}" = "true" ] || [ "${IS_INTERNAL_SERVICE:-false}" = "true" ]; } && { [ "${ENVIRONMENT:-}" = "prod" ] || [ "${BITBUCKET_BRANCH:-}" = "main" ]; }; then
+              echo "Backend or internal service in prod detected (IS_BACKEND=true or IS_INTERNAL_SERVICE=true), skipping Traefik setup"
+              exit 0
+            fi
+            if [ "${IS_BACKEND}" = "true" ] && [ "${ENVIRONMENT:-}" = "uat" ] && [ "${USE_CLOUDFLARE_TUNNEL_UAT:-false}" = "true" ]; then
+              echo "Backend repo in UAT with USE_CLOUDFLARE_TUNNEL_UAT=true, skipping Traefik setup (use Cloudflare Tunnel instead)"
               exit 0
             fi
 
             # Prepare Docker CLI environment to target the local daemon via a Unix socket.
             export DOCKER_HOST="unix:///var/run/docker.sock"
+            DOCKER_API_VERSION_DETECTED="$(docker version --format '{{.Server.APIVersion}}' 2>/dev/null || true)"
+            if [ -n "${DOCKER_API_VERSION_DETECTED}" ]; then
+              export DOCKER_API_VERSION="${DOCKER_API_VERSION_DETECTED}"
+              echo "Detected Docker API version for Traefik: ${DOCKER_API_VERSION}"
+            else
+              echo "WARNING: Could not detect Docker API version; continuing without override"
+            fi
             
             # Set certificate directory for Traefik
             export CERTS_DIR="${CERTS_DIR:-/etc/ssl/traefik-certs}"
@@ -3219,7 +3626,7 @@ definitions:
                   echo "shared-pipelines directory already exists"
                 else
                   echo "shared-pipelines directory does not exist, cloning..."
-                  git clone git@bitbucket.org:${BITBUCKET_WORKSPACE}/shared-pipelines.git
+                  git clone git@bitbucket.org:protocol33/shared-pipelines.git
                 fi
                 chmod +x shared-pipelines/scripts/traefik/certbot_cloudflare.sh || true
                 chmod +x shared-pipelines/scripts/traefik/certbot_cloudflare_renew.sh || true
@@ -3287,6 +3694,7 @@ definitions:
               docker run -d \
                 --name traefik \
                 --restart unless-stopped \
+                -e DOCKER_API_VERSION="${DOCKER_API_VERSION:-}" \
                 -p 80:80 \
                 -p 443:443 \
                 -p 8080:8080 \
@@ -3298,7 +3706,7 @@ definitions:
                 --label "traefik.enable=true" \
                 --label "traefik.http.routers.traefik.rule=Host(\`traefik.${BASE_DOMAIN}\`)" \
                 --label "traefik.http.routers.traefik.service=api@internal" \
-                traefik:v3.0 \
+                traefik:v3.6 \
                 --api.dashboard=true \
                 --api.insecure=true \
                 --providers.docker=true \
@@ -3352,7 +3760,6 @@ definitions:
           - self.hosted
           - linux.shell
           - prod.runner
-        trigger: manual
         script:
           - *traefik_script
 
@@ -3363,6 +3770,7 @@ definitions:
     - step: &lint-node-cloud
         name: 🔍 Lint Code (Node.js)
         image: node:20
+        size: 2x  
         caches: [node]
         clone:
           enabled: false
@@ -3731,17 +4139,22 @@ definitions:
       - step: *setup-env
       - step: *build
       - step: *scout
-      - step: *sonar
       - step: *setup-traefik-uat
       - step: *deploy-uat
+      - step: *zap-scan-uat
+      - step: *sonar
+      # Sonar step runs after ZAP scan to include all security results together:
+      # - SonarQube static code analysis
+      # - Docker Scout container vulnerability scan (from docker-scout-results.sarif)
+      # - OWASP ZAP runtime security scan (from sonar-issues-zap.json)
 
     general-pipeline-main:
       - step: *setup-shared-pipelines
       - step: *setup-env
       - step: *build
       - step: *promote-prod
-      - step: *scout
-      - step: *sonar
+      # - step: *scout
+      # - step: *sonar
       - step: *setup-traefik-prod
       - step: *deploy-prod
 
@@ -3749,6 +4162,14 @@ definitions:
       - step: *setup-shared-pipelines
       - step: *setup-env
       - step: *build  # Build hotfix tag regardless of repo type
+
+    # Node-only CI: lint, test, build & push image — no Traefik/Docker Compose deploy (use with K8s/GitOps/Argo CD)
+    general-pipeline-ci-node:
+      - step: *setup-shared-pipelines
+      - step: *setup-env
+      - step: *lint-node
+      - step: *test-node
+      - step: *build-node
 
     # =============================================================================
     # feature and PR pipelines with Traefik

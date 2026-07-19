@@ -47,18 +47,53 @@ fi
 export DOCKER_HOST="unix:///var/run/docker.sock"
 
 LETSENCRYPT_DIR="/etc/letsencrypt"
+# Default to same location as issuance script creates credentials
+CLOUDFLARE_DIR="${CLOUDFLARE_DIR:-/etc/letsencrypt/cloudflare}"
+CLOUDFLARE_CREDS="${CLOUDFLARE_CREDENTIALS:-$CLOUDFLARE_DIR/credentials.ini}"
 CERTBOT_IMAGE="certbot/dns-cloudflare:latest"
+
+if [ ! -f "$CLOUDFLARE_CREDS" ]; then
+  echo "ERROR: Cloudflare credentials file not found at $CLOUDFLARE_CREDS"
+  echo "Create it with 'dns_cloudflare_api_token = <token>' (chmod 600) before running renewals."
+  exit 1
+fi
 
 # Pre-pull image to ensure it's available
 docker pull "$CERTBOT_IMAGE" >/dev/null 2>&1 || true
 
 # Renew (non-interactive). certbot returns 0 even if nothing renewed.
-docker run --rm \
+# Capture output to check if certificates were actually renewed
+RENEW_OUTPUT=$(docker run --rm \
   -v "$LETSENCRYPT_DIR:/etc/letsencrypt" \
-  $CERTBOT_IMAGE renew --non-interactive || {
-    echo "ERROR: certbot renew failed"
-    exit 1
-  }
+  -v "$CLOUDFLARE_DIR:/cloudflare" \
+  $CERTBOT_IMAGE renew --non-interactive 2>&1)
+
+RENEW_EXIT_CODE=$?
+
+if [ $RENEW_EXIT_CODE -ne 0 ]; then
+  echo "ERROR: certbot renew failed"
+  echo "$RENEW_OUTPUT"
+  exit 1
+fi
+
+# Check if certificates were actually renewed
+# Certbot outputs messages like "Congratulations" or "renewed" when certificates are renewed
+if echo "$RENEW_OUTPUT" | grep -qiE "congratulations|renewed|renewing|expires.*days.*renew"; then
+  echo "Certificates were renewed, restarting Traefik..."
+  
+  # Allow override of Traefik container name via environment variable
+  TRAEFIK_CONTAINER="${TRAEFIK_CONTAINER_NAME:-traefik}"
+  
+  # Restart Traefik from host (not inside container)
+  if docker restart "$TRAEFIK_CONTAINER" >/dev/null 2>&1; then
+    echo "✅ Traefik restarted successfully"
+  else
+    echo "⚠️  WARNING: Failed to restart Traefik container '$TRAEFIK_CONTAINER'"
+    echo "⚠️  Please restart Traefik manually to pick up renewed certificates"
+  fi
+else
+  echo "No certificates needed renewal"
+fi
 
 echo "✅ Certbot renew completed"
 

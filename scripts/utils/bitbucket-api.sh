@@ -136,9 +136,8 @@ fetch_deployment_variables() {
 
 # Extract build arguments from deployment variables
 # Usage: deployment_vars_to_build_args <deployment_vars_output>
+# Output: KEY=VALUE, one per line (no --build-arg prefix)
 deployment_vars_to_build_args() {
-    local build_args=""
-    
     while IFS= read -r line; do
         if [[ "$line" =~ ^([^=]+)=(.*)$ ]]; then
             local var_name="${BASH_REMATCH[1]}"
@@ -147,12 +146,10 @@ deployment_vars_to_build_args() {
             # Export for use in the build process
             export "$var_name=$var_value"
             
-            # Add to build args if not empty
-            [ -n "$var_value" ] && build_args="$build_args --build-arg $var_name=$var_value"
+            # Emit non-empty values as KEY=VALUE lines; caller decides how to pass as build args
+            [ -n "$var_value" ] && echo "$var_name=$var_value"
         fi
     done
-    
-    echo "$build_args"
 }
 
 # Get build arguments using Bitbucket API with fallback to environment variables
@@ -161,11 +158,13 @@ get_build_args_with_api() {
     local target_env="$1"
     require_vars target_env
     
-    local build_args=""
+    local build_args_lines=""
     
     # Check if API integration is enabled (defaults to false - opt-in feature)
-    if [ "${USE_BITBUCKET_DEPLOYMENT_VARS:-false}" = "true" ]; then
-        log_info "Bitbucket deployment variables integration enabled (USE_BITBUCKET_DEPLOYMENT_VARS=true)"
+    # Support both USE_DEPLOYMENT_VARS (primary) and USE_BITBUCKET_DEPLOYMENT_VARS (backward compatibility)
+    local USE_DEPLOYMENT_VARS_EFFECTIVE="${USE_DEPLOYMENT_VARS:-${USE_BITBUCKET_DEPLOYMENT_VARS:-false}}"
+    if [ "${USE_DEPLOYMENT_VARS_EFFECTIVE}" = "true" ]; then
+        log_info "Bitbucket deployment variables integration enabled (USE_DEPLOYMENT_VARS / USE_BITBUCKET_DEPLOYMENT_VARS = true)"
         
         # Determine workspace and repo slug
         # BITBUCKET_WORKSPACE and BITBUCKET_REPO_SLUG are provided by Bitbucket Pipelines
@@ -182,8 +181,8 @@ get_build_args_with_api() {
             if deployment_vars=$(fetch_deployment_variables "$workspace" "$repo_slug" "$target_env"); then
                 if [ -n "$deployment_vars" ]; then
                     log_info "Using deployment variables from Bitbucket API"
-                    build_args=$(echo "$deployment_vars" | deployment_vars_to_build_args)
-                    echo "$build_args"
+                    build_args_lines=$(echo "$deployment_vars" | deployment_vars_to_build_args)
+                    echo "$build_args_lines"
                     return 0
                 else
                     log_warn "No deployment variables found via API for environment: $target_env"
@@ -207,12 +206,11 @@ get_build_args_with_api() {
             *_"$target_env_lower"|*_"$target_env_upper")
                 local base_name="${var_name%_*}"
                 export "$base_name=$var_value"
-                [ -n "$var_value" ] && build_args="$build_args --build-arg $base_name=$var_value"
+                # Emit non-empty values as KEY=VALUE lines; caller decides how to pass as build args
+                [ -n "$var_value" ] && echo "$base_name=$var_value"
             ;;
         esac
     done < <(env)
-    
-    echo "$build_args"
 }
 
 # Validate API credentials (matching pr_comment.sh pattern)

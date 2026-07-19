@@ -58,6 +58,15 @@ rm -f "$KEYFILE"
 if [ $NSUPDATE_EXIT -eq 0 ]; then
     echo "Successfully created A record: ${FULL_DOMAIN} -> ${TARGET_IP}"
     echo "https://${FULL_DOMAIN}"
+    if [ -x "$(dirname "$0")/../umbrella/sync_internal_domain.sh" ]; then
+        SUBDOMAIN="${SUBDOMAIN}" \
+        ZONE="${ZONE}" \
+        TARGET_IP="${TARGET_IP}" \
+        INTERNAL_DNS_SERVER="${INTERNAL_DNS_SERVER:-}" \
+        bash "$(dirname "$0")/../umbrella/sync_internal_domain.sh" || {
+            echo "WARNING: Umbrella sync script reported an error"
+        }
+    fi
 else
     echo "Failed to create A record"
     exit 1
